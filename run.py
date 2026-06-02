@@ -1,0 +1,370 @@
+import argparse
+import os
+import torch
+import torch.backends
+from utils.print_args import print_args
+import random
+import numpy as np
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in ('true', '1', 'yes', 'y'):
+        return True
+    if value in ('false', '0', 'no', 'n'):
+        return False
+    raise argparse.ArgumentTypeError('Boolean value expected.')
+
+
+def set_random_seed(seed, use_cuda=False):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if use_cuda:
+        torch.cuda.manual_seed_all(seed)
+
+
+def resolve_workspace_path(*parts):
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), *parts)
+
+
+def resolve_default_root_path(data):
+    dataset_roots = {
+        'ETTh1': ('all_datasets', 'ETT-small'),
+        'ETTh2': ('all_datasets', 'ETT-small'),
+        'ETTm1': ('all_datasets', 'ETT-small'),
+        'ETTm2': ('all_datasets', 'ETT-small'),
+        'm4': ('all_datasets', 'm4'),
+        'PSM': ('all_datasets', 'PSM'),
+        'MSL': ('all_datasets', 'MSL'),
+        'SMAP': ('all_datasets', 'SMAP'),
+        'SMD': ('all_datasets', 'SMD'),
+        'SWAT': ('all_datasets', 'SWAT'),
+        'UEA': ('all_datasets',),
+    }
+    return resolve_workspace_path(*dataset_roots.get(data, ('all_datasets',)))
+
+
+def build_setting(args, ii, seed, use_som=None):
+    setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_expand{}_dc{}_fc{}_eb{}_dt{}_{}_{}_seed{}_som{}'.format(
+        args.task_name,
+        args.model_id,
+        args.model,
+        args.data,
+        args.features,
+        args.seq_len,
+        args.label_len,
+        args.pred_len,
+        args.d_model,
+        args.n_heads,
+        args.e_layers,
+        args.d_layers,
+        args.d_ff,
+        args.expand,
+        args.d_conv,
+        args.factor,
+        args.embed,
+        args.distil,
+        args.des,
+        ii,
+        seed,
+        int(args.use_som if use_som is None else use_som))
+
+    if args.model == 'MambaSingleLayer' and args.task_name == 'classification':
+        setting = f'{args.task_name}_CLS_{args.model_id}_{args.model}_{args.data}_ft{args.features}' \
+                + f'_sl{args.seq_len}_ll{args.label_len}_pl{args.pred_len}_dm{args.d_model}_ds{args.d_ff}' \
+                + f'_expand{args.expand}_dc{args.d_conv}_nk{args.num_kernels}' \
+                + f'_tvdt{int(args.tv_dt)}_tvB{int(args.tv_B)}_tvC{int(args.tv_C)}_useD{int(args.use_D)}_{args.des}_{ii}_seed{seed}_som{int(args.use_som if use_som is None else use_som)}'
+    return setting
+
+
+def resolve_backbone_checkpoint(args, ii, seed):
+    if args.backbone_checkpoint:
+        return args.backbone_checkpoint.format(
+            setting=build_setting(args, ii, seed, use_som=False),
+            seed=seed,
+            ii=ii)
+
+    backbone_setting = build_setting(args, ii, seed, use_som=False)
+    return os.path.join(args.checkpoints, backbone_setting, 'checkpoint.pth')
+
+
+def empty_device_cache(args):
+    if args.use_gpu:
+        if args.gpu_type == 'mps':
+            torch.backends.mps.empty_cache()
+        elif args.gpu_type == 'cuda':
+            torch.cuda.empty_cache()
+
+
+def print_metric_average(results, seeds):
+    numeric_results = [result for result in results if isinstance(result, dict)]
+    if not numeric_results:
+        print('No numeric test metrics were returned, so seed averages could not be calculated.')
+        return
+
+    keys = [key for key, value in numeric_results[0].items() if isinstance(value, (int, float, np.floating))]
+    print('Average metrics over seeds {}:'.format(','.join(map(str, seeds))))
+    for key in keys:
+        values = [float(result[key]) for result in numeric_results if key in result]
+        print('{}:{:.4f}'.format(key, float(np.mean(values))))
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='TimesNet')
+
+    # basic config
+    parser.add_argument('--task_name', type=str, required=False, default='long_term_forecast',
+                        help='task name, options:[long_term_forecast, short_term_forecast, imputation, classification, anomaly_detection]')
+    parser.add_argument('--is_training', type=int, required=False, default=1, help='status')
+    parser.add_argument('--model_id', type=str, required=False, default='test', help='model id')
+    parser.add_argument('--model', type=str, required=True, default='DLinear',
+                        help='model name, options: [Autoformer, Transformer, TimesNet]')
+
+    # data loader
+    parser.add_argument('--data', type=str, required=False, default='ETTh1', help='dataset type')
+    parser.add_argument('--root_path', type=str, default="/workspace/datasets/ETT-small/", help='root path of the data file')
+    parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='data file')
+    parser.add_argument('--features', type=str, default='M',
+                        help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
+    parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
+    parser.add_argument('--freq', type=str, default='h',
+                        help='freq for time features encoding, options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly], you can also use more detailed freq like 15min or 3h')
+    parser.add_argument('--checkpoints', type=str, default=None, help='location of model checkpoints')
+
+    # forecasting task
+    parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
+    parser.add_argument('--label_len', type=int, default=48, help='start token length')
+    parser.add_argument('--pred_len', type=int, default=96, help='prediction sequence length')
+    parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
+    parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
+
+    # inputation task
+    parser.add_argument('--mask_rate', type=float, default=0.25, help='mask ratio')
+
+    # anomaly detection task
+    parser.add_argument('--anomaly_ratio', type=float, default=0.25, help='prior anomaly ratio (%%)')
+
+    # model define
+    parser.add_argument('--expand', type=int, default=2, help='expansion factor for Mamba')
+    parser.add_argument('--d_conv', type=int, default=4, help='conv kernel size for Mamba')
+    parser.add_argument('--tv_dt', type=int, default=0, help='whether to use time variant dt for MambaSL')
+    parser.add_argument('--tv_B', type=int, default=0, help='whether to use time variant B for MambaSL')
+    parser.add_argument('--tv_C', type=int, default=0, help='whether to use time variant C for MambaSL')
+    parser.add_argument('--use_D', type=int, default=0, help='whether to use D for MambaSL')
+    parser.add_argument('--top_k', type=int, default=5, help='for TimesBlock')
+    parser.add_argument('--num_kernels', type=int, default=6, help='for Inception')
+    parser.add_argument('--enc_in', type=int, default=7, help='encoder input size')
+    parser.add_argument('--dec_in', type=int, default=7, help='decoder input size')
+    parser.add_argument('--c_out', type=int, default=7, help='output size')
+    parser.add_argument('--d_model', type=int, default=512, help='dimension of model')
+    parser.add_argument('--n_heads', type=int, default=8, help='num of heads')
+    parser.add_argument('--e_layers', type=int, default=2, help='num of encoder layers')
+    parser.add_argument('--d_layers', type=int, default=1, help='num of decoder layers')
+    parser.add_argument('--d_ff', type=int, default=2048, help='dimension of fcn')
+    parser.add_argument('--moving_avg', type=int, default=25, help='window size of moving average')
+    parser.add_argument('--factor', type=int, default=1, help='attn factor')
+    parser.add_argument('--distil', action='store_false',
+                        help='whether to use distilling in encoder, using this argument means not using distilling',
+                        default=True)
+    parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
+    parser.add_argument('--embed', type=str, default='timeF',
+                        help='time features encoding, options:[timeF, fixed, learned]')
+    parser.add_argument('--activation', type=str, default='gelu', help='activation')
+    parser.add_argument('--channel_independence', type=int, default=1,
+                        help='0: channel dependence 1: channel independence for FreTS model')
+    parser.add_argument('--decomp_method', type=str, default='moving_avg',
+                        help='method of series decompsition, only support moving_avg or dft_decomp')
+    parser.add_argument('--use_norm', type=int, default=1, help='whether to use normalize; True 1 False 0')
+    parser.add_argument('--down_sampling_layers', type=int, default=0, help='num of down sampling layers')
+    parser.add_argument('--down_sampling_window', type=int, default=1, help='down sampling window size')
+    parser.add_argument('--down_sampling_method', type=str, default=None,
+                        help='down sampling method, only support avg, max, conv')
+    parser.add_argument('--seg_len', type=int, default=96,
+                        help='the length of segmen-wise iteration of SegRNN')
+
+    # optimization
+    parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')
+    parser.add_argument('--itr', type=int, default=1, help='experiments times')
+    parser.add_argument('--train_epochs', type=int, default=10, help='train epochs')
+    parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
+    parser.add_argument('--patience', type=int, default=3, help='early stopping patience')
+    parser.add_argument('--learning_rate', type=float, default=0.0001, help='optimizer learning rate')
+    parser.add_argument('--des', type=str, default='test', help='exp description')
+    parser.add_argument('--loss', type=str, default='MSE', help='loss function')
+    parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
+    parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
+
+    # GPU
+    parser.add_argument('--use_gpu', action='store_true', default=True, help='use gpu')
+    parser.add_argument('--no_use_gpu', action='store_false', dest='use_gpu', help='disable gpu (force cpu)')
+    parser.add_argument('--gpu', type=int, default=0, help='gpu')
+    parser.add_argument('--gpu_type', type=str, default='cuda', help='gpu type')  # cuda or mps
+    parser.add_argument('--use_multi_gpu', action='store_true', help='use multiple gpus', default=False)
+    parser.add_argument('--devices', type=str, default='0,1,2,3', help='device ids of multile gpus')
+
+    # de-stationary projector params
+    parser.add_argument('--p_hidden_dims', type=int, nargs='+', default=[128, 128],
+                        help='hidden layer dimensions of projector (List)')
+    parser.add_argument('--p_hidden_layers', type=int, default=2, help='number of hidden layers in projector')
+
+    # metrics (dtw)
+    parser.add_argument('--use_dtw', action='store_true', default=False,
+                        help='enable dtw metric (time consuming; default: off)')
+
+    # SOM sharp fluctuation calibration
+    parser.add_argument('--use_som', type=str2bool, nargs='?', const=True, default=False,
+                        help='enable SOM calibration module; freezes backbone and trains only SOM')
+    parser.add_argument('--seeds', type=int, nargs='+', default=[42, 43, 44, 45, 46], help='random seeds to run and average')
+    parser.add_argument('--backbone_checkpoint', type=str, default=None,
+                        help='pretrained backbone checkpoint path for --use_som; defaults to the matching som0 setting')
+    parser.add_argument('--som_use_mlp_head', type=str2bool, nargs='?', const=True, default=True,
+                        help='use residual prediction head')
+    parser.add_argument('--som_horizon_decay_floor', type=float, default=1.0,
+                        help='final-step multiplier for SOM correction; 1.0 disables horizon decay')
+    parser.add_argument('--som_horizon_decay_power', type=float, default=1.0,
+                        help='base shape of SOM horizon decay; larger values decay later steps more')
+
+    # Augmentation
+    parser.add_argument('--augmentation_ratio', type=int, default=0, help="How many times to augment")
+    parser.add_argument('--seed', type=int, default=2, help="Randomization seed")
+    parser.add_argument('--jitter', default=False, action="store_true", help="Jitter preset augmentation")
+    parser.add_argument('--scaling', default=False, action="store_true", help="Scaling preset augmentation")
+    parser.add_argument('--permutation', default=False, action="store_true",
+                        help="Equal Length Permutation preset augmentation")
+    parser.add_argument('--randompermutation', default=False, action="store_true",
+                        help="Random Length Permutation preset augmentation")
+    parser.add_argument('--magwarp', default=False, action="store_true", help="Magnitude warp preset augmentation")
+    parser.add_argument('--timewarp', default=False, action="store_true", help="Time warp preset augmentation")
+    parser.add_argument('--windowslice', default=False, action="store_true", help="Window slice preset augmentation")
+    parser.add_argument('--windowwarp', default=False, action="store_true", help="Window warp preset augmentation")
+    parser.add_argument('--rotation', default=False, action="store_true", help="Rotation preset augmentation")
+    parser.add_argument('--spawner', default=False, action="store_true", help="SPAWNER preset augmentation")
+    parser.add_argument('--dtwwarp', default=False, action="store_true", help="DTW warp preset augmentation")
+    parser.add_argument('--shapedtwwarp', default=False, action="store_true", help="Shape DTW warp preset augmentation")
+    parser.add_argument('--wdba', default=False, action="store_true", help="Weighted DBA preset augmentation")
+    parser.add_argument('--discdtw', default=False, action="store_true",
+                        help="Discrimitive DTW warp preset augmentation")
+    parser.add_argument('--discsdtw', default=False, action="store_true",
+                        help="Discrimitive shapeDTW warp preset augmentation")
+    parser.add_argument('--extra_tag', type=str, default="", help="Anything extra")
+
+    # TimeXer
+    parser.add_argument('--patch_len', type=int, default=16, help='patch length')
+
+    # GCN
+    parser.add_argument('--node_dim', type=int, default=10, help='each node embbed to dim dimentions')
+    parser.add_argument('--gcn_depth', type=int, default=2, help='')
+    parser.add_argument('--gcn_dropout', type=float, default=0.3, help='')
+    parser.add_argument('--propalpha', type=float, default=0.3, help='')
+    parser.add_argument('--conv_channel', type=int, default=32, help='')
+    parser.add_argument('--skip_channel', type=int, default=32, help='')
+
+    parser.add_argument('--individual', action='store_true', default=False,
+                        help='DLinear: a linear layer for each variate(channel) individually')
+
+    # TimeFilter
+    parser.add_argument('--alpha', type=float, default=0.1, help='KNN for Graph Construction')
+    parser.add_argument('--top_p', type=float, default=0.5, help='Dynamic Routing in MoE')
+    parser.add_argument('--pos', type=int, choices=[0, 1], default=1, help='Positional Embedding. Set pos to 0 or 1')
+
+    args = parser.parse_args()
+
+    # Fixed SOM defaults used across experiments.
+    args.som_mlp_width_scale_bound = 1.5
+    args.som_sharp_loss_alpha = 0.5
+    args.som_sharp_loss_max_weight = 5.0
+    args.som_sharp_eval_ratio = 0.2
+    args.som_loss_mae_weight = getattr(args, 'som_loss_mae_weight', 0.0)
+
+    if args.root_path is None:
+        args.root_path = resolve_default_root_path(args.data)
+    if args.checkpoints is None:
+        args.checkpoints = resolve_workspace_path('checkpoints')
+
+    set_random_seed(args.seeds[0], args.use_gpu and args.gpu_type == 'cuda')
+    args.seed = args.seeds[0]
+
+    if args.use_gpu and args.gpu_type == 'cuda' and torch.cuda.is_available():
+        args.device = torch.device('cuda:{}'.format(args.gpu))
+        print('Using GPU')
+    elif args.use_gpu and args.gpu_type == 'mps' and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        args.device = torch.device("mps")
+        print('Using mps')
+    else:
+        args.use_gpu = False
+        args.use_multi_gpu = False
+        args.device = torch.device("cpu")
+        print('Using CPU')
+
+    if args.use_gpu and args.use_multi_gpu:
+        args.devices = args.devices.replace(' ', '')
+        device_ids = args.devices.split(',')
+        args.device_ids = [int(id_) for id_ in device_ids]
+        args.gpu = args.device_ids[0]
+
+    print('Args in experiment:')
+    print_args(args)
+
+    if args.task_name == 'long_term_forecast':
+        from exp.exp_long_term_forecasting import Exp_Long_Term_Forecast
+        Exp = Exp_Long_Term_Forecast
+    elif args.task_name == 'short_term_forecast':
+        from exp.exp_short_term_forecasting import Exp_Short_Term_Forecast
+        Exp = Exp_Short_Term_Forecast
+    elif args.task_name == 'imputation':
+        from exp.exp_imputation import Exp_Imputation
+        Exp = Exp_Imputation
+    elif args.task_name == 'anomaly_detection':
+        from exp.exp_anomaly_detection import Exp_Anomaly_Detection
+        Exp = Exp_Anomaly_Detection
+    elif args.task_name == 'classification':
+        from exp.exp_classification import Exp_Classification
+        Exp = Exp_Classification
+    elif args.task_name == 'zero_shot_forecast':
+        from exp.exp_zero_shot_forecasting import Exp_Zero_Shot_Forecast
+        Exp = Exp_Zero_Shot_Forecast
+    else:
+        from exp.exp_long_term_forecasting import Exp_Long_Term_Forecast
+        Exp = Exp_Long_Term_Forecast
+
+    test_results = []
+    if args.is_training:
+        for seed in args.seeds:
+            args.seed = seed
+            set_random_seed(seed, args.use_gpu and args.gpu_type == 'cuda')
+            for ii in range(args.itr):
+                setting = build_setting(args, ii, seed)
+                if args.use_som:
+                    args.current_backbone_checkpoint = resolve_backbone_checkpoint(args, ii, seed)
+                    print('Loading pretrained backbone checkpoint for SOM: {}'.format(args.current_backbone_checkpoint))
+                else:
+                    args.current_backbone_checkpoint = None
+                exp = Exp(args)
+
+                print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
+                exp.train(setting)
+
+                print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
+                test_results.append(exp.test(setting))
+                empty_device_cache(args)
+    else:
+        for seed in args.seeds:
+            args.seed = seed
+            set_random_seed(seed, args.use_gpu and args.gpu_type == 'cuda')
+            for ii in range(args.itr):
+                setting = build_setting(args, ii, seed)
+                if args.use_som:
+                    args.current_backbone_checkpoint = resolve_backbone_checkpoint(args, ii, seed)
+                    print('Loading pretrained backbone checkpoint for SOM: {}'.format(args.current_backbone_checkpoint))
+                else:
+                    args.current_backbone_checkpoint = None
+                exp = Exp(args)
+
+                print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
+                test_results.append(exp.test(setting, test=1))
+                empty_device_cache(args)
+
+    print_metric_average(test_results, args.seeds)
