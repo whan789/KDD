@@ -70,6 +70,42 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return criterion
  
 
+    def _build_som_retrieval_memory(self, train_loader):
+        if not getattr(self.args, "use_som", False):
+            return
+        if getattr(self.args, "som_variant", "sharp") != "signed_spline":
+            return
+        if not hasattr(self.model, "set_retrieval_memory"):
+            return
+
+        max_samples = int(getattr(self.args, "som_retrieval_max_samples", 4096))
+        xs = []
+        ys = []
+        total = 0
+        f_dim = -1 if self.args.features == 'MS' else 0
+        for batch_x, batch_y, _, _ in train_loader:
+            x_mem = batch_x.float()
+            y_mem = batch_y.float()[:, -self.args.pred_len:, f_dim:]
+            remaining = max_samples - total
+            if remaining <= 0:
+                break
+            if x_mem.size(0) > remaining:
+                x_mem = x_mem[:remaining]
+                y_mem = y_mem[:remaining]
+            xs.append(x_mem)
+            ys.append(y_mem)
+            total += x_mem.size(0)
+
+        if not xs:
+            print("SIGNED_SPLINE retrieval memory skipped: no train samples were collected.")
+            return
+
+        x_memory = torch.cat(xs, dim=0).to(self.device)
+        y_memory = torch.cat(ys, dim=0).to(self.device)
+        self.model.set_retrieval_memory(x_memory, y_memory)
+        print("SIGNED_SPLINE retrieval memory: x={} y={}".format(tuple(x_memory.shape), tuple(y_memory.shape)))
+
+
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
         self.model.eval()
@@ -143,6 +179,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
+
+        self._build_som_retrieval_memory(train_loader)
 
         model_optim = self._select_optimizer()
         criterion = self._select_criterion()
@@ -221,6 +259,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         debug_stats.get("width_max", 0.0),
                         debug_stats.get("sharpness_mean", 0.0),
                     ))
+                    if "correction_abs_mean" in debug_stats:
+                        print("SOM correction | abs_mean:{:.6f} abs_max:{:.6f} y_abs_mean:{:.6f} ctx_abs_mean:{:.6f} ctx_abs_max:{:.6f}".format(
+                            debug_stats.get("correction_abs_mean", 0.0),
+                            debug_stats.get("correction_abs_max", 0.0),
+                            debug_stats.get("y_correction_abs_mean", 0.0),
+                            debug_stats.get("context_correction_abs_mean", 0.0),
+                            debug_stats.get("context_correction_abs_max", 0.0),
+                        ))
                     if "mlp_residual_abs_mean" in debug_stats:
                         print("SOM mlp residual | mean:{:.6f} abs_mean:{:.6f} abs_max:{:.6f}".format(
                             debug_stats.get("mlp_residual_mean", 0.0),

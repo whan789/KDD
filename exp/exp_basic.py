@@ -4,13 +4,20 @@ import torch.nn as nn
 import importlib
 import pkgutil  
 from utils.sharp_calibration import PostHocCalibration
+from utils.trend_calibration import PostHocTrendCalibration
+from utils.signed_spline_calibration import PostHocSignedSplineCalibration
 
 
-class BackboneWithSOM(nn.Module):
-    def __init__(self, backbone, freeze_backbone=True, som_kwargs=None, debug_grid=False):
-        super(BackboneWithSOM, self).__init__()
+class BackboneWithCalibration(nn.Module):
+    calibrator_cls = None
+    debug_label = "CAL"
+
+    def __init__(self, backbone, freeze_backbone=True, calibrator_kwargs=None, debug_grid=False):
+        super(BackboneWithCalibration, self).__init__()
+        if self.calibrator_cls is None:
+            raise ValueError("calibrator_cls must be defined on the subclass.")
         self.backbone = backbone
-        self.som = PostHocCalibration(**(som_kwargs or {}))
+        self.som = self.calibrator_cls(**(calibrator_kwargs or {}))
         self.freeze_backbone = freeze_backbone
         self.debug_grid = debug_grid
         self.last_debug_stats = None
@@ -21,7 +28,7 @@ class BackboneWithSOM(nn.Module):
             self.backbone.eval()
 
     def train(self, mode=True):
-        super(BackboneWithSOM, self).train(mode)
+        super(BackboneWithCalibration, self).train(mode)
         if self.freeze_backbone:
             self.backbone.eval()
         return self
@@ -31,6 +38,10 @@ class BackboneWithSOM(nn.Module):
             with torch.no_grad():
                 return self.backbone(*args, **kwargs)
         return self.backbone(*args, **kwargs)
+
+    def set_retrieval_memory(self, x_memory, y_memory):
+        if hasattr(self.som, "set_retrieval_memory"):
+            self.som.set_retrieval_memory(x_memory, y_memory)
 
     def forward_with_aux(self, *args, **kwargs):
         outputs = self._run_backbone(*args, **kwargs)
@@ -49,28 +60,92 @@ class BackboneWithSOM(nn.Module):
     def _update_debug_stats(self, aux):
         with torch.no_grad():
             widths = aux.get("adaptive_widths")
-            if widths is None:
+            if widths is not None:
+                stats = {
+                    "width_mean": float(widths.mean().item()),
+                    "width_std": float(widths.std().item()),
+                    "width_min": float(widths.min().item()),
+                    "width_max": float(widths.max().item()),
+                }
+                sharpness = aux.get("sharpness")
+                if sharpness is not None:
+                    stats["sharpness_mean"] = float(sharpness.mean().item())
+                correction = aux.get("correction")
+                if correction is not None:
+                    stats["correction_abs_mean"] = float(correction.abs().mean().item())
+                    stats["correction_abs_max"] = float(correction.abs().max().item())
+                y_correction = aux.get("y_correction")
+                if y_correction is not None:
+                    stats["y_correction_abs_mean"] = float(y_correction.abs().mean().item())
+                context_correction = aux.get("context_correction")
+                if context_correction is not None:
+                    stats["context_correction_abs_mean"] = float(context_correction.abs().mean().item())
+                    stats["context_correction_abs_max"] = float(context_correction.abs().max().item())
+                mlp_residual = aux.get("mlp_residual")
+                if mlp_residual is not None:
+                    stats["mlp_residual_mean"] = float(mlp_residual.mean().item())
+                    stats["mlp_residual_abs_mean"] = float(mlp_residual.abs().mean().item())
+                    stats["mlp_residual_abs_max"] = float(mlp_residual.abs().max().item())
+                self.last_debug_stats = stats
                 return
-            stats = {
-                "width_mean": float(widths.mean().item()),
-                "width_std": float(widths.std().item()),
-                "width_min": float(widths.min().item()),
-                "width_max": float(widths.max().item()),
-            }
-            sharpness = aux.get("sharpness")
-            if sharpness is not None:
-                stats["sharpness_mean"] = float(sharpness.mean().item())
-            mlp_residual = aux.get("mlp_residual")
-            if mlp_residual is not None:
-                stats["mlp_residual_mean"] = float(mlp_residual.mean().item())
-                stats["mlp_residual_abs_mean"] = float(mlp_residual.abs().mean().item())
-                stats["mlp_residual_abs_max"] = float(mlp_residual.abs().max().item())
+
+            y_global = aux.get("y_global")
+            retrieval_beta = aux.get("retrieval_beta")
+            stage2_residual = aux.get("stage2_residual")
+            if y_global is not None or retrieval_beta is not None or stage2_residual is not None:
+                stats = {}
+                if y_global is not None:
+                    stats["y_global_abs_mean"] = float(y_global.abs().mean().item())
+                if retrieval_beta is not None:
+                    stats["retrieval_beta_mean"] = float(retrieval_beta.mean().item())
+                if stage2_residual is not None:
+                    stats["stage2_residual_abs_mean"] = float(stage2_residual.abs().mean().item())
+                    stats["stage2_residual_abs_max"] = float(stage2_residual.abs().max().item())
+                correction = aux.get("correction")
+                if correction is not None:
+                    stats["correction_abs_mean"] = float(correction.abs().mean().item())
+                    stats["correction_abs_max"] = float(correction.abs().max().item())
+                self.last_debug_stats = stats
+                return
+
+            trend_delta = aux.get("trend_delta")
+            future_trend = aux.get("future_trend")
+            backbone_trend = aux.get("backbone_trend")
+            trend_gain = aux.get("trend_gain")
+            if trend_delta is None and future_trend is None and backbone_trend is None and trend_gain is None:
+                return
+
+            stats = {}
+            if trend_gain is not None:
+                stats["trend_gain"] = float(trend_gain.item() if trend_gain.numel() == 1 else trend_gain.mean().item())
+            if trend_delta is not None:
+                stats["trend_delta_abs_mean"] = float(trend_delta.abs().mean().item())
+                stats["trend_delta_abs_max"] = float(trend_delta.abs().max().item())
+            if future_trend is not None:
+                stats["future_trend_mean"] = float(future_trend.mean().item())
+            if backbone_trend is not None:
+                stats["backbone_trend_mean"] = float(backbone_trend.mean().item())
             self.last_debug_stats = stats
 
     def pop_debug_stats(self):
         stats = self.last_debug_stats
         self.last_debug_stats = None
         return stats
+
+
+class BackboneWithSOM(BackboneWithCalibration):
+    calibrator_cls = PostHocCalibration
+    debug_label = "SOM"
+
+
+class BackboneWithTrend(BackboneWithCalibration):
+    calibrator_cls = PostHocTrendCalibration
+    debug_label = "TREND"
+
+
+class BackboneWithSignedSpline(BackboneWithCalibration):
+    calibrator_cls = PostHocSignedSplineCalibration
+    debug_label = "SIGNED_SPLINE"
 
 # Just put your model files under models/ folder
 # e.g., models/Transformer.py, models/LSTM.py, etc.
@@ -92,26 +167,46 @@ class Exp_Basic(object):
         model = self._build_model()
         if getattr(self.args, "use_som", False):
             model = self._load_pretrained_backbone(model)
-            som_kwargs = self._build_som_kwargs()
-            model = BackboneWithSOM(model, freeze_backbone=True, som_kwargs=som_kwargs, debug_grid=getattr(self.args, "som_debug_grid", False))
-            print(f"SOM calibration args: {som_kwargs}")
+            calibration_kwargs = self._build_som_kwargs()
+            variant = getattr(self.args, "som_variant", "sharp")
+            wrapper_map = {
+                "sharp": BackboneWithSOM,
+                "trend": BackboneWithTrend,
+                "signed_spline": BackboneWithSignedSpline,
+            }
+            wrapper_cls = wrapper_map.get(variant, BackboneWithSOM)
+            model = wrapper_cls(
+                model,
+                freeze_backbone=True,
+                calibrator_kwargs=calibration_kwargs,
+                debug_grid=getattr(self.args, "som_debug_grid", False),
+            )
+            print(f"{variant.upper()} calibration args: {calibration_kwargs}")
             trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
             frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
-            print(f"Using SOM calibration: frozen backbone params={frozen}, trainable SOM params={trainable}")
+            print(f"Using {variant.upper()} calibration: frozen backbone params={frozen}, trainable SOM params={trainable}")
         self.model = model.to(self.device)
 
     def _build_som_kwargs(self):
         features = getattr(self.args, "features", None)
         c_out = getattr(self.args, "c_out", None)
         num_channels = 1 if features == "MS" else c_out
+        variant = getattr(self.args, "som_variant", "sharp")
 
-        return {
+        gamma_init_default = 0.0 if variant == "signed_spline" else -4.0
+        gamma_init = getattr(self.args, "som_gamma_init", None)
+        if gamma_init is None:
+            gamma_init = gamma_init_default
+
+        kwargs = {
             "num_knots": 8,
-            "gamma_bound": 0.5,
-            "beta_bound": 0.25,
+            "gamma_bound": getattr(self.args, "som_gamma_bound", 0.5),
+            "beta_bound": getattr(self.args, "som_beta_bound", 0.25),
+            "gamma_init": gamma_init,
+            "beta_init": getattr(self.args, "som_beta_init", 0.0),
             "grid_width": 0.25,
             "learnable_grid": True,
-            "moving_avg_kernel": 3,
+            "moving_avg_kernel": getattr(self.args, "som_moving_avg_kernel", 3),
             "d2_weight": 1.0,
             "sharpness_temperature": 1.0,
             "adaptive_grid": True,
@@ -134,6 +229,27 @@ class Exp_Basic(object):
             "num_channels": num_channels,
             "eps": 1e-6,
         }
+
+        if variant == "signed_spline":
+            kwargs.update({
+                "residual_head_type": "kan",
+                "slope_bound": getattr(self.args, "som_slope_bound", 0.5),
+                "bias_bound": getattr(self.args, "som_bias_bound", 0.1),
+                "context_bound": getattr(self.args, "som_context_bound", 1.0),
+                "slope_init": getattr(self.args, "som_slope_init", 0.0),
+                "bias_init": getattr(self.args, "som_bias_init", 0.0),
+                "retrieval_topk": getattr(self.args, "som_retrieval_topk", 10),
+                "retrieval_temperature": getattr(self.args, "som_retrieval_temperature", 1.0),
+                "retrieval_beta_init": getattr(self.args, "som_retrieval_beta_init", 0.1),
+            })
+
+        if variant == "trend":
+            kwargs.update({
+                "seq_len": getattr(self.args, "seq_len", None),
+                "pred_len": getattr(self.args, "pred_len", None),
+            })
+
+        return kwargs
 
     def _load_pretrained_backbone(self, model):
         checkpoint_path = getattr(self.args, "current_backbone_checkpoint", None) or getattr(

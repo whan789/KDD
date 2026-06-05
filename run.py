@@ -48,7 +48,10 @@ def resolve_default_root_path(data):
 
 
 def build_setting(args, ii, seed, use_som=None):
-    setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_expand{}_dc{}_fc{}_eb{}_dt{}_{}_{}_seed{}_som{}'.format(
+    som_flag = int(args.use_som if use_som is None else use_som)
+    som_variant = getattr(args, 'som_variant', 'sharp')
+    som_suffix = f'_{som_variant}' if som_flag else ''
+    setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_expand{}_dc{}_fc{}_eb{}_dt{}_{}_{}_seed{}_som{}{}'.format(
         args.task_name,
         args.model_id,
         args.model,
@@ -70,15 +73,12 @@ def build_setting(args, ii, seed, use_som=None):
         args.des,
         ii,
         seed,
-        int(args.use_som if use_som is None else use_som))
+        som_flag,
+        som_suffix)
 
     if args.model == 'MambaSingleLayer' and args.task_name == 'classification':
-        setting = f'{args.task_name}_CLS_{args.model_id}_{args.model}_{args.data}_ft{args.features}' \
-                + f'_sl{args.seq_len}_ll{args.label_len}_pl{args.pred_len}_dm{args.d_model}_ds{args.d_ff}' \
-                + f'_expand{args.expand}_dc{args.d_conv}_nk{args.num_kernels}' \
-                + f'_tvdt{int(args.tv_dt)}_tvB{int(args.tv_B)}_tvC{int(args.tv_C)}_useD{int(args.use_D)}_{args.des}_{ii}_seed{seed}_som{int(args.use_som if use_som is None else use_som)}'
+        setting = f'{args.task_name}_CLS_{args.model_id}_{args.model}_{args.data}_ft{args.features}'                 + f'_sl{args.seq_len}_ll{args.label_len}_pl{args.pred_len}_dm{args.d_model}_ds{args.d_ff}'                 + f'_expand{args.expand}_dc{args.d_conv}_nk{args.num_kernels}'                 + f'_tvdt{int(args.tv_dt)}_tvB{int(args.tv_B)}_tvC{int(args.tv_C)}_useD{int(args.use_D)}_{args.des}_{ii}_seed{seed}_som{som_flag}{som_suffix}'
     return setting
-
 
 def resolve_backbone_checkpoint(args, ii, seed):
     if args.backbone_checkpoint:
@@ -125,7 +125,7 @@ if __name__ == '__main__':
 
     # data loader
     parser.add_argument('--data', type=str, required=False, default='ETTh1', help='dataset type')
-    parser.add_argument('--root_path', type=str, default="/workspace/datasets/ETT-small/", help='root path of the data file')
+    parser.add_argument('--root_path', type=str, default="/datasets/ETT-small/", help='root path of the data file')
     parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='data file')
     parser.add_argument('--features', type=str, default='M',
                         help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
@@ -217,11 +217,49 @@ if __name__ == '__main__':
     # SOM sharp fluctuation calibration
     parser.add_argument('--use_som', type=str2bool, nargs='?', const=True, default=False,
                         help='enable SOM calibration module; freezes backbone and trains only SOM')
-    parser.add_argument('--seeds', type=int, nargs='+', default=[42, 43, 44, 45, 46], help='random seeds to run and average')
+    parser.add_argument('--som_variant', type=str, default='sharp', choices=['sharp', 'trend', 'signed_spline'],
+                        help='select the calibration variant used when --use_som is enabled')
+    parser.add_argument('--som_lr', type=float, default=1e-3,
+                        help='learning rate used when --use_som is enabled')
+    parser.add_argument('--som_lradj', type=str, default='type3',
+                        help='learning rate schedule used when --use_som is enabled')
+    parser.add_argument('--som_moving_avg_kernel', type=int, default=3,
+                        help='moving average kernel used by SOM/trend calibration; must be a positive odd integer')
+    parser.add_argument('--som_gamma_bound', type=float, default=0.5,
+                        help='upper bound for spline gamma correction')
+    parser.add_argument('--som_beta_bound', type=float, default=0.25,
+                        help='absolute bound for spline beta correction')
+    parser.add_argument('--som_gamma_init', type=float, default=None,
+                        help='initial raw value for spline gamma table; defaults to -4.0 for sharp and 0.0 for signed_spline')
+    parser.add_argument('--som_beta_init', type=float, default=0.0,
+                        help='initial raw value for spline beta table')
+    parser.add_argument('--som_slope_bound', type=float, default=0.5,
+                        help='absolute bound for signed_spline d1/slope correction')
+    parser.add_argument('--som_bias_bound', type=float, default=0.1,
+                        help='absolute bound for signed_spline level/bias correction')
+    parser.add_argument('--som_context_bound', type=float, default=1.0,
+                        help='multiplier for signed_spline input-context dynamics correction')
+    parser.add_argument('--som_slope_init', type=float, default=0.0,
+                        help='initial raw value for signed_spline d1/slope table')
+    parser.add_argument('--som_bias_init', type=float, default=0.0,
+                        help='initial raw value for signed_spline level/bias table')
+    parser.add_argument('--seeds', type=int, nargs='+', default=[42, 43, 44], help='random seeds to run and average')
     parser.add_argument('--backbone_checkpoint', type=str, default=None,
                         help='pretrained backbone checkpoint path for --use_som; defaults to the matching som0 setting')
     parser.add_argument('--som_use_mlp_head', type=str2bool, nargs='?', const=True, default=True,
                         help='use residual prediction head')
+    parser.add_argument('--som_mlp_width_scale_bound', type=float, default=1.5,
+                        help='bound multiplier for SOM residual head output')
+    parser.add_argument('--som_retrieval_topk', type=int, default=10,
+                        help='number of train instances retrieved for signed_spline global revision')
+    parser.add_argument('--som_retrieval_temperature', type=float, default=1.0,
+                        help='softmax temperature for signed_spline retrieval weights')
+    parser.add_argument('--som_retrieval_beta_init', type=float, default=0.1,
+                        help='initial gate value for signed_spline retrieval global revision')
+    parser.add_argument('--som_retrieval_max_samples', type=int, default=4096,
+                        help='maximum train windows stored in signed_spline retrieval memory')
+    parser.add_argument('--som_debug_grid', type=str2bool, nargs='?', const=True, default=False,
+                        help='print SOM grid and correction diagnostics during training')
     parser.add_argument('--som_horizon_decay_floor', type=float, default=1.0,
                         help='final-step multiplier for SOM correction; 1.0 disables horizon decay')
     parser.add_argument('--som_horizon_decay_power', type=float, default=1.0,
@@ -273,7 +311,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # Fixed SOM defaults used across experiments.
-    args.som_mlp_width_scale_bound = 1.5
+    args.som_mlp_width_scale_bound = getattr(args, 'som_mlp_width_scale_bound', 1.5)
     args.som_sharp_loss_alpha = 0.5
     args.som_sharp_loss_max_weight = 5.0
     args.som_sharp_eval_ratio = 0.2
@@ -283,6 +321,9 @@ if __name__ == '__main__':
         args.root_path = resolve_default_root_path(args.data)
     if args.checkpoints is None:
         args.checkpoints = resolve_workspace_path('checkpoints')
+    if args.use_som:
+        args.learning_rate = args.som_lr
+        args.lradj = args.som_lradj
 
     set_random_seed(args.seeds[0], args.use_gpu and args.gpu_type == 'cuda')
     args.seed = args.seeds[0]

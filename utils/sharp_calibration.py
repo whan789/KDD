@@ -43,6 +43,8 @@ class SharpFluctuationCalibrator(nn.Module):
         num_knots=8,
         gamma_bound=0.5,
         beta_bound=0.25,
+        gamma_init=-4.0,
+        beta_init=0.0,
         grid_width=0.25,
         learnable_grid=True,
         moving_avg_kernel=3,
@@ -138,8 +140,8 @@ class SharpFluctuationCalibrator(nn.Module):
             self.register_buffer("log_grid_width", torch.log(width))
 
         param_shape = (num_knots, num_channels) if channel_wise else (num_knots, 1)
-        self.gamma_logits = nn.Parameter(torch.full(param_shape, -4.0))
-        self.beta_logits = nn.Parameter(torch.zeros(param_shape))
+        self.gamma_logits = nn.Parameter(torch.full(param_shape, float(gamma_init)))
+        self.beta_logits = nn.Parameter(torch.full(param_shape, float(beta_init)))
 
         # Residual head. The mlp mode reproduces the best point-wise residual setup.
         self.mlp_in_dim = 9

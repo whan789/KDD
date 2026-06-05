@@ -56,6 +56,19 @@ def print_args(args):
         print("[1m" + "SOM Calibration Params" + "[0m")
         print(f'  {"Use MLP Head:":<20}{args.som_use_mlp_head:<20}{"Residual Bound:":<20}{args.som_mlp_width_scale_bound:<20}')
         print(f'  {"Decay Floor:":<20}{args.som_horizon_decay_floor:<20}{"Decay Power:":<20}{args.som_horizon_decay_power:<20}')
+        if hasattr(args, "som_moving_avg_kernel"):
+            print(f'  {"SOM MA Kernel:":<20}{args.som_moving_avg_kernel:<20}')
+        if hasattr(args, "som_gamma_bound"):
+            gamma_init = args.som_gamma_init if args.som_gamma_init is not None else "auto"
+            print(f'  {"Gamma Bound:":<20}{args.som_gamma_bound:<20}{"Beta Bound:":<20}{args.som_beta_bound:<20}')
+            print(f'  {"Gamma Init:":<20}{gamma_init:<20}{"Beta Init:":<20}{args.som_beta_init:<20}')
+        if hasattr(args, "som_slope_bound"):
+            print(f'  {"Slope Bound:":<20}{args.som_slope_bound:<20}{"Bias Bound:":<20}{args.som_bias_bound:<20}')
+            if hasattr(args, "som_context_bound"):
+                print(f'  {"Context Bound:":<20}{args.som_context_bound:<20}')
+            print(f'  {"Slope Init:":<20}{args.som_slope_init:<20}{"Bias Init:":<20}{args.som_bias_init:<20}')
+        if hasattr(args, "som_lr"):
+            print(f'  {"SOM LR:":<20}{args.som_lr:<20}{"SOM Lradj:":<20}{args.som_lradj:<20}')
         print()
     print("\033[1m" + "GPU" + "\033[0m")
     print(f'  {"Use GPU:":<20}{args.use_gpu:<20}{"GPU:":<20}{args.gpu:<20}')
