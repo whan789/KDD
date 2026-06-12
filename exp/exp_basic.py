@@ -6,6 +6,8 @@ import pkgutil
 from utils.sharp_calibration import PostHocCalibration
 from utils.trend_calibration import PostHocTrendCalibration
 from utils.signed_spline_calibration import PostHocSignedSplineCalibration
+from utils.curvature_features import ShapeAwareSOMCalibration
+from utils.prototype_derivative_som import PrototypeDerivativeSOMCalibration
 
 
 class BackboneWithCalibration(nn.Module):
@@ -48,7 +50,9 @@ class BackboneWithCalibration(nn.Module):
         if torch.is_tensor(outputs) and outputs.dim() == 3:
             x_context = args[0] if len(args) > 0 and torch.is_tensor(args[0]) and args[0].dim() == 3 else None
             calibrated, aux = self.som(outputs, x_context=x_context, return_params=True)
+            self.last_aux = aux
             return outputs, calibrated, aux
+        self.last_aux = {}
         return outputs, outputs, {}
 
     def forward(self, *args, **kwargs):
@@ -59,14 +63,16 @@ class BackboneWithCalibration(nn.Module):
 
     def _update_debug_stats(self, aux):
         with torch.no_grad():
+            stats = {}
+
             widths = aux.get("adaptive_widths")
             if widths is not None:
-                stats = {
+                stats.update({
                     "width_mean": float(widths.mean().item()),
                     "width_std": float(widths.std().item()),
                     "width_min": float(widths.min().item()),
                     "width_max": float(widths.max().item()),
-                }
+                })
                 sharpness = aux.get("sharpness")
                 if sharpness is not None:
                     stats["sharpness_mean"] = float(sharpness.mean().item())
@@ -86,14 +92,11 @@ class BackboneWithCalibration(nn.Module):
                     stats["mlp_residual_mean"] = float(mlp_residual.mean().item())
                     stats["mlp_residual_abs_mean"] = float(mlp_residual.abs().mean().item())
                     stats["mlp_residual_abs_max"] = float(mlp_residual.abs().max().item())
-                self.last_debug_stats = stats
-                return
 
             y_global = aux.get("y_global")
             retrieval_beta = aux.get("retrieval_beta")
             stage2_residual = aux.get("stage2_residual")
             if y_global is not None or retrieval_beta is not None or stage2_residual is not None:
-                stats = {}
                 if y_global is not None:
                     stats["y_global_abs_mean"] = float(y_global.abs().mean().item())
                 if retrieval_beta is not None:
@@ -105,6 +108,35 @@ class BackboneWithCalibration(nn.Module):
                 if correction is not None:
                     stats["correction_abs_mean"] = float(correction.abs().mean().item())
                     stats["correction_abs_max"] = float(correction.abs().max().item())
+
+            prototype_usage = aux.get("prototype_usage")
+            if prototype_usage is not None:
+                usage = prototype_usage.detach().float().reshape(-1)
+                usage = usage / usage.sum().clamp_min(1e-8)
+                entropy = -(usage * torch.log(usage.clamp_min(1e-8))).sum()
+                perplexity = torch.exp(entropy)
+                stats.update({
+                    "prototype_usage_min": float(usage.min().item()),
+                    "prototype_usage_max": float(usage.max().item()),
+                    "prototype_usage_entropy": float(entropy.item()),
+                    "prototype_usage_perplexity": float(perplexity.item()),
+                    "prototype_usage_active": int((usage > 1e-3).sum().item()),
+                    "prototype_usage_top": [round(float(v), 6) for v in torch.topk(usage, k=min(3, usage.numel())).values.cpu().tolist()],
+                })
+                reconstruction_loss = aux.get("reconstruction_loss")
+                if reconstruction_loss is not None:
+                    stats["reconstruction_loss"] = float(reconstruction_loss.detach().item())
+                vq_loss = aux.get("vq_loss")
+                if vq_loss is not None:
+                    stats["vq_loss"] = float(vq_loss.detach().item())
+                commitment_loss = aux.get("commitment_loss")
+                if commitment_loss is not None:
+                    stats["commitment_loss"] = float(commitment_loss.detach().item())
+                codebook_loss = aux.get("codebook_loss")
+                if codebook_loss is not None:
+                    stats["codebook_loss"] = float(codebook_loss.detach().item())
+
+            if stats:
                 self.last_debug_stats = stats
                 return
 
@@ -147,6 +179,16 @@ class BackboneWithSignedSpline(BackboneWithCalibration):
     calibrator_cls = PostHocSignedSplineCalibration
     debug_label = "SIGNED_SPLINE"
 
+
+class BackboneWithDerivativeSOM(BackboneWithCalibration):
+    calibrator_cls = ShapeAwareSOMCalibration
+    debug_label = "DERIVATIVE"
+
+
+class BackboneWithPrototypeDerivativeSOM(BackboneWithCalibration):
+    calibrator_cls = PrototypeDerivativeSOMCalibration
+    debug_label = "PROTOTYPE_DERIVATIVE"
+
 # Just put your model files under models/ folder
 # e.g., models/Transformer.py, models/LSTM.py, etc.
 # All models will be automatically detected and can be used by specifying their names.
@@ -173,6 +215,8 @@ class Exp_Basic(object):
                 "sharp": BackboneWithSOM,
                 "trend": BackboneWithTrend,
                 "signed_spline": BackboneWithSignedSpline,
+                "derivative": BackboneWithDerivativeSOM,
+                "prototype_derivative": BackboneWithPrototypeDerivativeSOM,
             }
             wrapper_cls = wrapper_map.get(variant, BackboneWithSOM)
             model = wrapper_cls(
@@ -225,10 +269,66 @@ class Exp_Basic(object):
             "mlp_width_scale_bound": getattr(self.args, "som_mlp_width_scale_bound", 1.5),
             "horizon_decay_floor": getattr(self.args, "som_horizon_decay_floor", 1.0),
             "horizon_decay_power": getattr(self.args, "som_horizon_decay_power", 1.0),
+            "use_dynamics_gate": getattr(self.args, "som_use_dynamics_gate", False),
+            "dynamics_gate_init": getattr(self.args, "som_dynamics_gate_init", 0.5),
+            "dynamics_gate_floor": getattr(self.args, "som_dynamics_gate_floor", 0.0),
             "channel_wise": True,
             "num_channels": num_channels,
             "eps": 1e-6,
         }
+
+        if variant == "derivative":
+            return {
+                "num_channels": num_channels,
+                "seq_len": getattr(self.args, "seq_len", None),
+                "pred_len": getattr(self.args, "pred_len", None),
+                "correction_scale": getattr(self.args, "som_correction_scale", 1.0),
+                "use_times2d_modulation": getattr(self.args, "som_use_times2d_modulation", False),
+                "num_knots": getattr(self.args, "som_num_knots", 8),
+                "modulation_bound": getattr(self.args, "som_times2d_modulation_bound", 0.5),
+                "modulation_init": getattr(self.args, "som_times2d_modulation_init", 0.0),
+                "d2_weight": getattr(self.args, "som_d2_weight", 1.0),
+                "sharpness_temperature": getattr(self.args, "som_sharpness_temperature", 1.0),
+                "channel_wise": True,
+                "eps": 1e-6,
+            }
+
+        if variant == "prototype_derivative":
+            return {
+                "num_channels": num_channels,
+                "seq_len": getattr(self.args, "seq_len", None),
+                "pred_len": getattr(self.args, "pred_len", None),
+                "num_prototypes": getattr(self.args, "som_num_prototypes", 8),
+                "prototype_window": getattr(self.args, "som_recent_len", 12),
+                "prototype_temperature": getattr(self.args, "som_prototype_temperature", 1.0),
+                "prototype_stride": getattr(self.args, "som_segment_stride", None),
+                "prototype_mode": getattr(self.args, "som_prototype_mode", "cosine"),
+                "prototype_distance": getattr(self.args, "som_prototype_distance", "l2"),
+                "prototype_latent_dim": getattr(self.args, "som_prototype_latent_dim", None),
+                "commitment_weight": getattr(self.args, "som_commitment_loss_weight", 0.25),
+                "ema_codebook_update": getattr(self.args, "som_vq_ema_update", False),
+                "ema_decay": getattr(self.args, "som_vq_ema_decay", 0.99),
+                "ema_eps": getattr(self.args, "som_vq_ema_eps", 1e-5),
+                "correction_scale": getattr(self.args, "som_correction_scale", 1.0),
+                "gate_init": getattr(self.args, "som_gate_init", 0.1),
+                "num_knots": 8,
+                "gamma_bound": getattr(self.args, "som_gamma_bound", 0.5),
+                "beta_bound": getattr(self.args, "som_beta_bound", 0.25),
+                "gamma_init": gamma_init,
+                "beta_init": getattr(self.args, "som_beta_init", 0.0),
+                "grid_width": 0.25,
+                "learnable_grid": True,
+                "moving_avg_kernel": getattr(self.args, "som_moving_avg_kernel", 3),
+                "d2_weight": 1.0,
+                "sharpness_temperature": 1.0,
+                "adaptive_grid": True,
+                "adaptive_grid_sharpness": 1.0,
+                "adaptive_grid_min_scale": 0.5,
+                "adaptive_grid_max_scale": 1.0,
+                "horizon_decay_floor": getattr(self.args, "som_horizon_decay_floor", 1.0),
+                "horizon_decay_power": getattr(self.args, "som_horizon_decay_power", 1.0),
+                "eps": 1e-6,
+            }
 
         if variant == "signed_spline":
             kwargs.update({

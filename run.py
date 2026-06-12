@@ -32,19 +32,19 @@ def resolve_workspace_path(*parts):
 
 def resolve_default_root_path(data):
     dataset_roots = {
-        'ETTh1': ('all_datasets', 'ETT-small'),
-        'ETTh2': ('all_datasets', 'ETT-small'),
-        'ETTm1': ('all_datasets', 'ETT-small'),
-        'ETTm2': ('all_datasets', 'ETT-small'),
-        'm4': ('all_datasets', 'm4'),
-        'PSM': ('all_datasets', 'PSM'),
-        'MSL': ('all_datasets', 'MSL'),
-        'SMAP': ('all_datasets', 'SMAP'),
-        'SMD': ('all_datasets', 'SMD'),
-        'SWAT': ('all_datasets', 'SWAT'),
-        'UEA': ('all_datasets',),
+        'ETTh1': ('datasets', 'ETT-small'),
+        'ETTh2': ('datasets', 'ETT-small'),
+        'ETTm1': ('datasets', 'ETT-small'),
+        'ETTm2': ('datasets', 'ETT-small'),
+        'm4': ('datasets', 'm4'),
+        'PSM': ('datasets', 'PSM'),
+        'MSL': ('datasets', 'MSL'),
+        'SMAP': ('datasets', 'SMAP'),
+        'SMD': ('datasets', 'SMD'),
+        'SWAT': ('datasets', 'SWAT'),
+        'UEA': ('datasets',),
     }
-    return resolve_workspace_path(*dataset_roots.get(data, ('all_datasets',)))
+    return resolve_workspace_path(*dataset_roots.get(data, ('datasets',)))
 
 
 def build_setting(args, ii, seed, use_som=None):
@@ -124,9 +124,9 @@ if __name__ == '__main__':
                         help='model name, options: [Autoformer, Transformer, TimesNet]')
 
     # data loader
-    parser.add_argument('--data', type=str, required=False, default='ETTh1', help='dataset type')
-    parser.add_argument('--root_path', type=str, default="/datasets/ETT-small/", help='root path of the data file')
-    parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='data file')
+    parser.add_argument('--data', type=str, required=False, default='ETTm1', help='dataset type')
+    parser.add_argument('--root_path', type=str, default=None, help='root path of the data file')
+    parser.add_argument('--data_path', type=str, default='ETTm1.csv', help='data file')
     parser.add_argument('--features', type=str, default='M',
                         help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
     parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
@@ -217,7 +217,7 @@ if __name__ == '__main__':
     # SOM sharp fluctuation calibration
     parser.add_argument('--use_som', type=str2bool, nargs='?', const=True, default=False,
                         help='enable SOM calibration module; freezes backbone and trains only SOM')
-    parser.add_argument('--som_variant', type=str, default='sharp', choices=['sharp', 'trend', 'signed_spline'],
+    parser.add_argument('--som_variant', type=str, default='sharp', choices=['sharp', 'trend', 'signed_spline', 'derivative', 'prototype_derivative'],
                         help='select the calibration variant used when --use_som is enabled')
     parser.add_argument('--som_lr', type=float, default=1e-3,
                         help='learning rate used when --use_som is enabled')
@@ -264,6 +264,60 @@ if __name__ == '__main__':
                         help='final-step multiplier for SOM correction; 1.0 disables horizon decay')
     parser.add_argument('--som_horizon_decay_power', type=float, default=1.0,
                         help='base shape of SOM horizon decay; larger values decay later steps more')
+    parser.add_argument('--som_use_dynamics_gate', type=str2bool, nargs='?', const=True, default=False,
+                        help='scale SOM correction with a d1/d2 sharpness gate')
+    parser.add_argument('--som_dynamics_gate_init', type=float, default=0.5,
+                        help='initial sigmoid output of the d1/d2 correction gate at zero sharpness')
+    parser.add_argument('--som_dynamics_gate_floor', type=float, default=0.0,
+                        help='minimum residual fraction preserved by the d1/d2 correction gate')
+    parser.add_argument('--som_recent_len', type=int, default=12,
+                        help='sliding-window length for prototype_derivative d1/d2 tokens')
+    parser.add_argument('--som_segment_stride', type=int, default=None,
+                        help='sliding-window stride for prototype_derivative; defaults to window length')
+    parser.add_argument('--som_correction_scale', type=float, default=1.0,
+                        help='scale multiplier for derivative-aware SOM correction')
+    parser.add_argument('--som_num_knots', type=int, default=8,
+                        help='number of spline knots used by SOM-style modulation')
+    parser.add_argument('--som_d2_weight', type=float, default=1.0,
+                        help='relative weight of second derivative when computing SOM sharpness')
+    parser.add_argument('--som_sharpness_temperature', type=float, default=1.0,
+                        help='temperature used to squash SOM sharpness scores')
+    parser.add_argument('--som_use_times2d_modulation', type=str2bool, nargs='?', const=True, default=False,
+                        help='modulate Times2D derivative correction with a spline-style SOM map')
+    parser.add_argument('--som_times2d_modulation_bound', type=float, default=0.5,
+                        help='maximum residual scaling offset applied on top of Times2D correction')
+    parser.add_argument('--som_times2d_modulation_init', type=float, default=0.0,
+                        help='initial raw value for the Times2D modulation spline table')
+    parser.add_argument('--som_num_prototypes', type=int, default=8,
+                        help='number of local d1/d2 prototypes for prototype_derivative')
+    parser.add_argument('--som_prototype_temperature', type=float, default=1.0,
+                        help='soft assignment temperature for prototype_derivative prototypes')
+    parser.add_argument('--som_prototype_mode', type=str, default='cosine', choices=['cosine', 'vq_vae'],
+                        help='prototype assignment mode for prototype_derivative')
+    parser.add_argument('--som_prototype_distance', type=str, default='l2', choices=['l2', 'cosine'],
+                        help='distance function used to match derivative latents with prototypes')
+    parser.add_argument('--som_codebook_loss_weight', type=float, default=0.01,
+                        help='VQ auxiliary loss weight used only when som_prototype_mode=vq_vae')
+    parser.add_argument('--som_reconstruction_loss_weight', type=float, default=0.01,
+                        help='derivative-token reconstruction loss weight for prototype_derivative')
+    parser.add_argument('--som_commitment_loss_weight', type=float, default=0.25,
+                        help='commitment term weight inside the VQ auxiliary loss')
+    parser.add_argument('--som_vq_ema_update', type=str2bool, nargs='?', const=True, default=False,
+                        help='update prototype_derivative VQ codebook with EMA instead of codebook gradients')
+    parser.add_argument('--som_vq_ema_decay', type=float, default=0.99,
+                        help='EMA decay used for prototype_derivative VQ codebook updates')
+    parser.add_argument('--som_vq_ema_eps', type=float, default=1e-5,
+                        help='numerical epsilon used for prototype_derivative VQ EMA normalization')
+    parser.add_argument('--som_prototype_latent_dim', type=int, default=None,
+                        help='latent dimension for prototype_derivative token encoder; defaults to 2 * som_recent_len')
+    parser.add_argument('--som_kmeans_init', type=str2bool, nargs='?', const=True, default=False,
+                        help='initialize prototype_derivative codebook with one-time k-means over sampled train latents')
+    parser.add_argument('--som_kmeans_max_tokens', type=int, default=20000,
+                        help='maximum derivative latent tokens used for prototype_derivative k-means initialization')
+    parser.add_argument('--som_kmeans_iters', type=int, default=50,
+                        help='number of iterations for prototype_derivative k-means initialization')
+    parser.add_argument('--som_gate_init', type=float, default=0.1,
+                        help='initial sigmoid gate value for derivative-aware SOM')
 
     # Augmentation
     parser.add_argument('--augmentation_ratio', type=int, default=0, help="How many times to augment")

@@ -4,6 +4,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def finite_differences(x):
+    if x.dim() != 3:
+        raise ValueError("Expected input shape [B, L, D].")
+
+    d1 = torch.zeros_like(x)
+    d1[:, 1:, :] = x[:, 1:, :] - x[:, :-1, :]
+
+    d2 = torch.zeros_like(x)
+    d2[:, 1:, :] = d1[:, 1:, :] - d1[:, :-1, :]
+    return d1, d2
+
+
 class KANResidualHead(nn.Module):
     """
     Additive feature-wise spline head in the KAN spirit.
@@ -68,6 +80,11 @@ class SignedSplineFluctuationCalibrator(nn.Module):
         retrieval_topk=10,
         retrieval_temperature=1.0,
         retrieval_beta_init=0.1,
+        use_dynamics_gate=False,
+        dynamics_gate_init=0.5,
+        dynamics_gate_floor=0.0,
+        d2_weight=1.0,
+        sharpness_temperature=1.0,
         eps=1e-6,
         **legacy_kwargs,
     ):
@@ -95,6 +112,14 @@ class SignedSplineFluctuationCalibrator(nn.Module):
             raise ValueError("retrieval_temperature must be positive.")
         if retrieval_beta_init <= 0 or retrieval_beta_init >= 1:
             raise ValueError("retrieval_beta_init must be in (0, 1).")
+        if dynamics_gate_init <= 0 or dynamics_gate_init >= 1:
+            raise ValueError("dynamics_gate_init must be in (0, 1).")
+        if dynamics_gate_floor < 0 or dynamics_gate_floor >= 1:
+            raise ValueError("dynamics_gate_floor must be in [0, 1).")
+        if d2_weight < 0:
+            raise ValueError("d2_weight must be >= 0.")
+        if sharpness_temperature <= 0:
+            raise ValueError("sharpness_temperature must be positive.")
 
         self.num_knots = num_knots
         self.use_mlp_head = use_mlp_head
@@ -107,11 +132,18 @@ class SignedSplineFluctuationCalibrator(nn.Module):
         self.horizon_decay_length_power = 1.5
         self.retrieval_topk = retrieval_topk
         self.retrieval_temperature = retrieval_temperature
+        self.use_dynamics_gate = use_dynamics_gate
+        self.dynamics_gate_floor = dynamics_gate_floor
+        self.d2_weight = d2_weight
+        self.sharpness_temperature = sharpness_temperature
         self.eps = eps
 
         beta_logit = math.log(retrieval_beta_init / (1.0 - retrieval_beta_init))
         self.retrieval_beta_bias = nn.Parameter(torch.tensor(beta_logit, dtype=torch.float32))
         self.retrieval_beta_sim_weight = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        gate_logit = math.log(dynamics_gate_init / (1.0 - dynamics_gate_init))
+        self.dynamics_gate_bias = nn.Parameter(torch.tensor(gate_logit, dtype=torch.float32))
+        self.dynamics_gate_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
         self.register_buffer("memory_keys", torch.empty(0), persistent=False)
         self.register_buffer("memory_values", torch.empty(0), persistent=False)
@@ -272,6 +304,22 @@ class SignedSplineFluctuationCalibrator(nn.Module):
         )
         return y_global, beta, sim_score
 
+    def _sharpness_score(self, d1, d2):
+        d1_scale = d1.abs().mean(dim=1, keepdim=True).detach() + self.eps
+        d2_scale = d2.abs().mean(dim=1, keepdim=True).detach() + self.eps
+
+        d1_norm = d1.abs() / d1_scale
+        d2_norm = d2.abs() / d2_scale
+        score = torch.sqrt(d1_norm.pow(2) + self.d2_weight * d2_norm.pow(2) + self.eps)
+        temperature = max(float(self.sharpness_temperature), self.eps)
+        return 1.0 - torch.exp(-score / temperature)
+
+    def _compute_dynamics_gate(self, sharpness):
+        gate = torch.sigmoid(self.dynamics_gate_scale * sharpness + self.dynamics_gate_bias)
+        if self.dynamics_gate_floor > 0.0:
+            gate = self.dynamics_gate_floor + (1.0 - self.dynamics_gate_floor) * gate
+        return gate
+
     def _predict_stage2_residual(self, y_scaled, y_hat, x_context, y_global, beta):
         x_tail = self._prepare_residual_context(y_hat, x_context)
         x_trend = self._temporal_moving_average(x_tail)
@@ -330,6 +378,13 @@ class SignedSplineFluctuationCalibrator(nn.Module):
         else:
             correction = torch.zeros_like(y_hat)
 
+        dynamics_gate = None
+        y_d1, y_d2 = finite_differences(y_scaled)
+        y_sharpness = self._sharpness_score(y_d1, y_d2)
+        if self.use_dynamics_gate:
+            dynamics_gate = self._compute_dynamics_gate(y_sharpness)
+            correction = correction * dynamics_gate
+
         horizon_len = y_hat.size(1)
         horizon_scale = max(float(horizon_len) / float(self.horizon_decay_ref_len), 1e-6)
         effective_power = float(self.horizon_decay_power) * (horizon_scale ** float(self.horizon_decay_length_power))
@@ -354,6 +409,10 @@ class SignedSplineFluctuationCalibrator(nn.Module):
             "global_delta": global_delta,
             "stage2_residual": stage2_residual,
             "correction": correction,
+            "y_d1": y_d1,
+            "y_d2": y_d2,
+            "y_sharpness": y_sharpness,
+            "dynamics_gate": dynamics_gate,
             "x_context_aligned": x_tail,
             "x_context_sharp": x_sharp,
             "horizon_decay": horizon_decay,

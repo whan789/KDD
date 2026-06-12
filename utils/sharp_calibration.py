@@ -66,6 +66,9 @@ class SharpFluctuationCalibrator(nn.Module):
         mlp_width_scale_bound=1.0,
         horizon_decay_floor=1.0,
         horizon_decay_power=1.0,
+        use_dynamics_gate=False,
+        dynamics_gate_init=0.5,
+        dynamics_gate_floor=0.0,
         channel_wise=False,
         num_channels=None,
         eps=1e-6,
@@ -102,6 +105,10 @@ class SharpFluctuationCalibrator(nn.Module):
             raise ValueError("horizon_decay_floor must be in (0, 1].")
         if horizon_decay_power <= 0:
             raise ValueError("horizon_decay_power must be positive.")
+        if dynamics_gate_init <= 0 or dynamics_gate_init >= 1:
+            raise ValueError("dynamics_gate_init must be in (0, 1).")
+        if dynamics_gate_floor < 0 or dynamics_gate_floor >= 1:
+            raise ValueError("dynamics_gate_floor must be in [0, 1).")
         if channel_wise and num_channels is None:
             raise ValueError("num_channels is required when channel_wise=True.")
 
@@ -126,6 +133,8 @@ class SharpFluctuationCalibrator(nn.Module):
         self.horizon_decay_power = horizon_decay_power
         self.horizon_decay_ref_len = 720
         self.horizon_decay_length_power = 1.5
+        self.use_dynamics_gate = use_dynamics_gate
+        self.dynamics_gate_floor = dynamics_gate_floor
         self.channel_wise = channel_wise
         self.num_channels = num_channels
         self.eps = eps
@@ -142,6 +151,11 @@ class SharpFluctuationCalibrator(nn.Module):
         param_shape = (num_knots, num_channels) if channel_wise else (num_knots, 1)
         self.gamma_logits = nn.Parameter(torch.full(param_shape, float(gamma_init)))
         self.beta_logits = nn.Parameter(torch.full(param_shape, float(beta_init)))
+
+        gate_shape = (num_channels,) if (channel_wise and num_channels is not None) else (1,)
+        gate_bias = torch.full(gate_shape, torch.logit(torch.tensor(float(dynamics_gate_init))))
+        self.dynamics_gate_bias = nn.Parameter(gate_bias)
+        self.dynamics_gate_scale = nn.Parameter(torch.ones(gate_shape))
 
         # Residual head. The mlp mode reproduces the best point-wise residual setup.
         self.mlp_in_dim = 9
@@ -237,6 +251,15 @@ class SharpFluctuationCalibrator(nn.Module):
         basis_sum = basis.sum(dim=-1, keepdim=True).clamp_min(self.eps)
         return basis / basis_sum, widths
 
+    def _compute_dynamics_gate(self, sharpness):
+        gate_bias = self.dynamics_gate_bias.view(1, 1, -1)
+        gate_scale = self.dynamics_gate_scale.view(1, 1, -1)
+        gate_logits = gate_scale * sharpness + gate_bias
+        gate = torch.sigmoid(gate_logits)
+        if self.dynamics_gate_floor > 0.0:
+            gate = self.dynamics_gate_floor + (1.0 - self.dynamics_gate_floor) * gate
+        return gate
+
     def _predict_residual_with_mlp(self, y_hat, d1, d2, local_deviation, sharpness, x_dynamics):
         if x_dynamics is None:
             x_sharpness = torch.zeros_like(sharpness)
@@ -325,6 +348,11 @@ class SharpFluctuationCalibrator(nn.Module):
         if mlp_residual is not None:
             correction = correction + mlp_residual
 
+        dynamics_gate = None
+        if self.use_dynamics_gate:
+            dynamics_gate = self._compute_dynamics_gate(sharpness)
+            correction = correction * dynamics_gate
+
         horizon_len = y_hat.size(1)
         horizon_scale = max(float(horizon_len) / float(self.horizon_decay_ref_len), 1e-6)
         effective_power = float(self.horizon_decay_power) * (horizon_scale ** float(self.horizon_decay_length_power))
@@ -355,6 +383,7 @@ class SharpFluctuationCalibrator(nn.Module):
             "knot_basis": basis,
             "adaptive_widths": widths,
             "mlp_residual": mlp_residual,
+            "dynamics_gate": dynamics_gate,
             "horizon_decay": horizon_decay,
         }
         return calibrated, aux

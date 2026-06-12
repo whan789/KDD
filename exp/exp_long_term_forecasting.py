@@ -106,6 +106,66 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         print("SIGNED_SPLINE retrieval memory: x={} y={}".format(tuple(x_memory.shape), tuple(y_memory.shape)))
 
 
+
+    def _initialize_som_kmeans_codebook(self, train_loader):
+        if not getattr(self.args, "use_som", False):
+            return
+        if getattr(self.args, "som_variant", "sharp") != "prototype_derivative":
+            return
+        if not getattr(self.args, "som_kmeans_init", False):
+            return
+
+        som_model = self.model.module if hasattr(self.model, "module") else self.model
+        som = getattr(som_model, "som", None)
+        if som is None or not hasattr(som, "encode_derivative_latents"):
+            print("PROTOTYPE_DERIVATIVE k-means init skipped: calibrator does not expose latent encoder.")
+            return
+        if not hasattr(som, "initialize_prototypes_kmeans"):
+            print("PROTOTYPE_DERIVATIVE k-means init skipped: calibrator does not expose k-means initializer.")
+            return
+
+        max_tokens = int(getattr(self.args, "som_kmeans_max_tokens", 20000))
+        num_iters = int(getattr(self.args, "som_kmeans_iters", 50))
+        if max_tokens <= 0:
+            print("PROTOTYPE_DERIVATIVE k-means init skipped: som_kmeans_max_tokens <= 0.")
+            return
+
+        was_training = self.model.training
+        self.model.eval()
+        latents = []
+        total = 0
+        with torch.no_grad():
+            for batch_x, _, _, _ in train_loader:
+                batch_x = batch_x.float().to(self.device)
+                batch_latents = som.encode_derivative_latents(batch_x)
+                remaining = max_tokens - total
+                if remaining <= 0:
+                    break
+                if batch_latents.size(0) > remaining:
+                    indices = torch.randperm(batch_latents.size(0), device=batch_latents.device)[:remaining]
+                    batch_latents = batch_latents[indices]
+                latents.append(batch_latents.detach().cpu())
+                total += batch_latents.size(0)
+                if total >= max_tokens:
+                    break
+        if was_training:
+            self.model.train()
+
+        if not latents:
+            print("PROTOTYPE_DERIVATIVE k-means init skipped: no derivative latents were collected.")
+            return
+
+        latents = torch.cat(latents, dim=0).to(self.device)
+        stats = som.initialize_prototypes_kmeans(latents, num_iters=num_iters)
+        if stats.get("initialized", False):
+            print(
+                "PROTOTYPE_DERIVATIVE k-means init: tokens={} iters={} usage_min={:.4f} usage_max={:.4f}".format(
+                    stats["num_latents"], stats["num_iters"], stats["usage_min"], stats["usage_max"]
+                )
+            )
+        else:
+            print("PROTOTYPE_DERIVATIVE k-means init skipped: {}".format(stats.get("reason", "unknown reason")))
+
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
         self.model.eval()
@@ -140,6 +200,32 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         self.model.train()
         return total_loss
 
+    def _select_som_aux_loss(self):
+        if not getattr(self.args, "use_som", False):
+            return None
+        if getattr(self.args, "som_variant", "sharp") != "prototype_derivative":
+            return None
+
+        som_model = self.model.module if hasattr(self.model, "module") else self.model
+        aux = getattr(som_model, "last_aux", None)
+        if not aux:
+            return None
+
+        loss = None
+        if getattr(self.args, "som_prototype_mode", "cosine") == "vq_vae":
+            vq_weight = float(getattr(self.args, "som_codebook_loss_weight", 0.01))
+            vq_loss = aux.get("vq_loss")
+            if vq_weight > 0.0 and vq_loss is not None:
+                loss = vq_weight * vq_loss
+
+        recon_weight = float(getattr(self.args, "som_reconstruction_loss_weight", 0.01))
+        reconstruction_loss = aux.get("reconstruction_loss")
+        if recon_weight > 0.0 and reconstruction_loss is not None:
+            recon_term = recon_weight * reconstruction_loss
+            loss = recon_term if loss is None else loss + recon_term
+
+        return loss
+
     def _select_loss(self, outputs, targets, criterion):
         alpha = float(getattr(self.args, "som_sharp_loss_alpha", 0.5))
         mae_weight = float(getattr(self.args, "som_loss_mae_weight", 0.0))
@@ -161,10 +247,59 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         err = outputs - targets
         weighted_mse = (err.pow(2) * weights).sum() / weights.sum().clamp_min(1e-6)
-        if mae_weight <= 0.0:
-            return weighted_mse
-        weighted_mae = (err.abs() * weights).sum() / weights.sum().clamp_min(1e-6)
-        return weighted_mse + mae_weight * weighted_mae
+        loss = weighted_mse
+        if mae_weight > 0.0:
+            weighted_mae = (err.abs() * weights).sum() / weights.sum().clamp_min(1e-6)
+            loss = loss + mae_weight * weighted_mae
+
+        return loss
+
+    def _collect_prototype_epoch_stats(self, epoch_stats):
+        if not getattr(self.args, "use_som", False):
+            return
+        if getattr(self.args, "som_variant", "sharp") != "prototype_derivative":
+            return
+
+        som_model = self.model.module if hasattr(self.model, "module") else self.model
+        aux = getattr(som_model, "last_aux", None)
+        if not aux:
+            return
+
+        scalar_keys = (
+            "reconstruction_loss",
+            "vq_loss",
+            "codebook_loss",
+            "commitment_loss",
+        )
+        for key in scalar_keys:
+            value = aux.get(key)
+            if value is not None:
+                epoch_stats[key].append(float(value.detach().item()))
+
+        usage = aux.get("prototype_usage")
+        if usage is not None:
+            usage = usage.detach().float().reshape(-1)
+            usage = usage / usage.sum().clamp_min(1e-8)
+            entropy = -(usage * torch.log(usage.clamp_min(1e-8))).sum()
+            epoch_stats["prototype_usage_entropy"].append(float(entropy.item()))
+            epoch_stats["prototype_usage_perplexity"].append(float(torch.exp(entropy).item()))
+            epoch_stats["prototype_usage_active"].append(float((usage > 1e-3).sum().item()))
+            epoch_stats["prototype_usage_max"].append(float(usage.max().item()))
+
+    def _summarize_prototype_epoch_stats(self, epoch_stats):
+        summary = {}
+        for key, values in epoch_stats.items():
+            if values:
+                summary[key] = float(np.mean(values))
+        return summary
+
+    def _format_epoch_delta(self, current, previous, digits=6):
+        if current is None:
+            return "n/a"
+        if previous is None:
+            return f"{current:.{digits}f}"
+        delta = current - previous
+        return f"{current:.{digits}f} ({delta:+.{digits}f})"
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
@@ -181,6 +316,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
 
         self._build_som_retrieval_memory(train_loader)
+        self._initialize_som_kmeans_codebook(train_loader)
+        time_now = time.time()
 
         model_optim = self._select_optimizer()
         criterion = self._select_criterion()
@@ -188,9 +325,20 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         if self.args.use_amp:
             scaler = torch.cuda.amp.GradScaler()
 
+        prev_prototype_summary = None
         for epoch in range(self.args.train_epochs):
             iter_count = 0
             train_loss = []
+            prototype_epoch_stats = {
+                "reconstruction_loss": [],
+                "vq_loss": [],
+                "codebook_loss": [],
+                "commitment_loss": [],
+                "prototype_usage_entropy": [],
+                "prototype_usage_perplexity": [],
+                "prototype_usage_active": [],
+                "prototype_usage_max": [],
+            }
 
             self.model.train()
             epoch_time = time.time()
@@ -215,6 +363,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         outputs = outputs[:, -self.args.pred_len:, f_dim:]
                         batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                         loss = self._select_loss(outputs, batch_y, criterion)
+                        aux_loss = self._select_som_aux_loss()
+                        if aux_loss is not None:
+                            loss = loss + aux_loss
                         train_loss.append(loss.item())
                 else:
                     outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
@@ -223,6 +374,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     outputs = outputs[:, -self.args.pred_len:, f_dim:]
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                     loss = self._select_loss(outputs, batch_y, criterion)
+                    aux_loss = self._select_som_aux_loss()
+                    if aux_loss is not None:
+                        loss = loss + aux_loss
                     train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:
@@ -241,6 +395,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     loss.backward()
                     model_optim.step()
 
+                self._collect_prototype_epoch_stats(prototype_epoch_stats)
+
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
             vali_loss = self.vali(vali_data, vali_loader, criterion)
@@ -249,29 +405,40 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
                 epoch + 1, train_steps, train_loss, vali_loss, test_loss))
 
-            if getattr(self.args, "use_som", False) and getattr(self.args, "som_debug_grid", False) and hasattr(self.model, "pop_debug_stats"):
-                debug_stats = self.model.pop_debug_stats()
-                if debug_stats:
-                    print("SOM grid stats | width mean:{:.6f} std:{:.6f} min:{:.6f} max:{:.6f} sharp mean:{:.6f}".format(
-                        debug_stats.get("width_mean", 0.0),
-                        debug_stats.get("width_std", 0.0),
-                        debug_stats.get("width_min", 0.0),
-                        debug_stats.get("width_max", 0.0),
-                        debug_stats.get("sharpness_mean", 0.0),
-                    ))
-                    if "correction_abs_mean" in debug_stats:
-                        print("SOM correction | abs_mean:{:.6f} abs_max:{:.6f} y_abs_mean:{:.6f} ctx_abs_mean:{:.6f} ctx_abs_max:{:.6f}".format(
-                            debug_stats.get("correction_abs_mean", 0.0),
-                            debug_stats.get("correction_abs_max", 0.0),
-                            debug_stats.get("y_correction_abs_mean", 0.0),
-                            debug_stats.get("context_correction_abs_mean", 0.0),
-                            debug_stats.get("context_correction_abs_max", 0.0),
+            if getattr(self.args, "use_som", False) and getattr(self.args, "som_debug_grid", False):
+                if getattr(self.args, "som_variant", "sharp") == "prototype_derivative":
+                    prototype_summary = self._summarize_prototype_epoch_stats(prototype_epoch_stats)
+                    if prototype_summary:
+                        print("Prototype epoch avg | recon:{} vq:{} codebook:{} commit:{}".format(
+                            self._format_epoch_delta(prototype_summary.get("reconstruction_loss"), None if prev_prototype_summary is None else prev_prototype_summary.get("reconstruction_loss")),
+                            self._format_epoch_delta(prototype_summary.get("vq_loss"), None if prev_prototype_summary is None else prev_prototype_summary.get("vq_loss")),
+                            self._format_epoch_delta(prototype_summary.get("codebook_loss"), None if prev_prototype_summary is None else prev_prototype_summary.get("codebook_loss")),
+                            self._format_epoch_delta(prototype_summary.get("commitment_loss"), None if prev_prototype_summary is None else prev_prototype_summary.get("commitment_loss")),
                         ))
-                    if "mlp_residual_abs_mean" in debug_stats:
-                        print("SOM mlp residual | mean:{:.6f} abs_mean:{:.6f} abs_max:{:.6f}".format(
-                            debug_stats.get("mlp_residual_mean", 0.0),
-                            debug_stats.get("mlp_residual_abs_mean", 0.0),
-                            debug_stats.get("mlp_residual_abs_max", 0.0),
+                        if "prototype_usage_entropy" in prototype_summary:
+                            print("Prototype usage avg | entropy:{} perplexity:{} active:{:.2f} top1:{}".format(
+                                self._format_epoch_delta(prototype_summary.get("prototype_usage_entropy"), None if prev_prototype_summary is None else prev_prototype_summary.get("prototype_usage_entropy")),
+                                self._format_epoch_delta(prototype_summary.get("prototype_usage_perplexity"), None if prev_prototype_summary is None else prev_prototype_summary.get("prototype_usage_perplexity"), digits=3),
+                                prototype_summary.get("prototype_usage_active", 0.0),
+                                self._format_epoch_delta(prototype_summary.get("prototype_usage_max"), None if prev_prototype_summary is None else prev_prototype_summary.get("prototype_usage_max")),
+                            ))
+                        prev_prototype_summary = prototype_summary
+                elif hasattr(self.model, "pop_debug_stats"):
+                    debug_stats = self.model.pop_debug_stats()
+                    if debug_stats and "prototype_usage_entropy" in debug_stats:
+                        print("Prototype usage | min:{:.6f} max:{:.6f} entropy:{:.6f} perplexity:{:.3f} active:{} top:{}".format(
+                            debug_stats.get("prototype_usage_min", 0.0),
+                            debug_stats.get("prototype_usage_max", 0.0),
+                            debug_stats.get("prototype_usage_entropy", 0.0),
+                            debug_stats.get("prototype_usage_perplexity", 0.0),
+                            debug_stats.get("prototype_usage_active", 0),
+                            debug_stats.get("prototype_usage_top", []),
+                        ))
+                        print("Prototype aux | recon:{:.6f} vq:{:.6f} codebook:{:.6f} commit:{:.6f}".format(
+                            debug_stats.get("reconstruction_loss", 0.0),
+                            debug_stats.get("vq_loss", 0.0),
+                            debug_stats.get("codebook_loss", 0.0),
+                            debug_stats.get("commitment_loss", 0.0),
                         ))
             early_stopping(vali_loss, self.model, path)
             if early_stopping.early_stop:
@@ -445,14 +612,16 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         f.write('\n')
         f.close()
 
-        np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe]))
+        metric_values = [mse, mae]
         if sharp_mae is not None and sharp_mse is not None:
-            np.save(folder_path + 'sharp_metrics.npy', np.array([sharp_mae, sharp_mse]))
+            metric_values.extend([sharp_mse, sharp_mae])
+            np.save(folder_path + 'sharp_metrics.npy', np.array([sharp_mse, sharp_mae]))
+        np.save(folder_path + 'metrics.npy', np.array(metric_values))
         np.save(folder_path + 'pred.npy', preds)
         np.save(folder_path + 'true.npy', trues)
 
-        results = {'mae': mae, 'mse': mse, 'rmse': rmse, 'mape': mape, 'mspe': mspe}
+        results = {'mse': mse, 'mae': mae}
         if sharp_mae is not None and sharp_mse is not None:
-            results['sharp_mae'] = sharp_mae
             results['sharp_mse'] = sharp_mse
+            results['sharp_mae'] = sharp_mae
         return results
