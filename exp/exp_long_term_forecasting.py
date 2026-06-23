@@ -226,30 +226,157 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         return loss
 
+    def _finite_differences(self, values):
+        d1 = torch.zeros_like(values)
+        d1[:, 1:, :] = values[:, 1:, :] - values[:, :-1, :]
+        d2 = torch.zeros_like(values)
+        d2[:, 1:, :] = d1[:, 1:, :] - d1[:, :-1, :]
+        return d1, d2
+
+    def _normalize_need_component(self, values):
+        scale = values.mean(dim=1, keepdim=True).clamp_min(1e-6)
+        return values / scale
+
+    def _local_mean(self, values, window):
+        if window <= 1:
+            return values
+        values_t = values.permute(0, 2, 1)
+        smoothed = torch.nn.functional.avg_pool1d(
+            values_t,
+            kernel_size=window,
+            stride=1,
+            padding=window // 2,
+            count_include_pad=False,
+        )
+        return smoothed.permute(0, 2, 1)
+
+    def _local_range(self, values, window):
+        if window <= 1:
+            return torch.zeros_like(values)
+        values_t = values.permute(0, 2, 1)
+        local_max = torch.nn.functional.max_pool1d(values_t, kernel_size=window, stride=1, padding=window // 2)
+        local_min = -torch.nn.functional.max_pool1d(-values_t, kernel_size=window, stride=1, padding=window // 2)
+        return (local_max - local_min).permute(0, 2, 1)
+
+    def _need_score(self, targets):
+        window = int(getattr(self.args, "som_need_window", 9))
+        if window < 1:
+            window = 1
+        if window % 2 == 0:
+            window += 1
+
+        d1, d2 = self._finite_differences(targets)
+        excursion = self._local_range(targets, window)
+        derivative_energy = self._local_mean(d1.abs(), window)
+        d2_weight = float(getattr(self.args, "som_need_d2_weight", 0.5))
+        if d2_weight > 0.0:
+            derivative_energy = derivative_energy + d2_weight * self._local_mean(d2.abs(), window)
+
+        excursion_weight = float(getattr(self.args, "som_need_excursion_weight", 1.0))
+        derivative_weight = float(getattr(self.args, "som_need_derivative_weight", 0.5))
+        score = excursion_weight * self._normalize_need_component(excursion)
+        if derivative_weight > 0.0:
+            score = score + derivative_weight * self._normalize_need_component(derivative_energy)
+
+        score = score / score.mean(dim=1, keepdim=True).clamp_min(1e-6)
+        return score.detach(), d1, d2
+
+    def _weighted_mse(self, outputs, targets, weights):
+        return ((outputs - targets).pow(2) * weights).sum() / weights.numel()
+
+    def _band_limited_fft_mse(self, outputs, targets, low_ratio, high_ratio):
+        freq_outputs = torch.fft.rfft(outputs, dim=1)
+        freq_targets = torch.fft.rfft(targets, dim=1)
+
+        mag_outputs = freq_outputs.abs()
+        mag_targets = freq_targets.abs()
+
+        num_bins = mag_outputs.size(1)
+        if num_bins <= 1:
+            return mag_outputs.new_zeros(())
+
+        low_ratio = float(min(max(low_ratio, 0.0), 1.0))
+        high_ratio = float(min(max(high_ratio, 0.0), 1.0))
+        if high_ratio <= low_ratio:
+            return mag_outputs.new_zeros(())
+
+        low_idx = int(num_bins * low_ratio)
+        high_idx = int(num_bins * high_ratio)
+        low_idx = min(max(low_idx, 0), num_bins - 1)
+        high_idx = min(max(high_idx, low_idx + 1), num_bins)
+
+        band_outputs = mag_outputs[:, low_idx:high_idx, :]
+        band_targets = mag_targets[:, low_idx:high_idx, :]
+        return torch.mean((band_outputs - band_targets).pow(2))
+
+    def _detail_component(self, values):
+        window = int(getattr(self.args, "som_residual_detail_window", 25))
+        if window < 1:
+            window = 1
+        if window % 2 == 0:
+            window += 1
+        return values - self._local_mean(values, window)
+
     def _select_loss(self, outputs, targets, criterion):
-        alpha = float(getattr(self.args, "som_sharp_loss_alpha", 0.5))
+        alpha = float(getattr(self.args, "som_sharp_loss_alpha", 0.0))
         mae_weight = float(getattr(self.args, "som_loss_mae_weight", 0.0))
+        variant = getattr(self.args, "som_variant", "sharp")
         if not getattr(self.args, "use_som", False):
             return criterion(outputs, targets)
+
+        if variant == "derivative_sharpening":
+            weights = torch.ones_like(targets)
+            output_weight = float(getattr(self.args, "som_need_output_loss_weight", 1.0))
+            loss = output_weight * self._weighted_mse(outputs, targets, weights)
+            output_d1_weight = float(getattr(self.args, "som_output_d1_loss_weight", 0.1))
+            output_d2_weight = float(getattr(self.args, "som_output_d2_loss_weight", 0.05))
+            fft_d1_weight = float(getattr(self.args, "som_output_d1_fft_loss_weight", 0.05))
+            fft_low_ratio = float(getattr(self.args, "som_output_d1_fft_low_ratio", 0.1))
+            fft_high_ratio = float(getattr(self.args, "som_output_d1_fft_high_ratio", 0.4))
+
+            if output_d1_weight > 0.0 or output_d2_weight > 0.0 or fft_d1_weight > 0.0:
+                out_d1, out_d2 = self._finite_differences(outputs)
+                tgt_d1, tgt_d2 = self._finite_differences(targets)
+
+                if output_d1_weight > 0.0:
+                    loss = loss + output_d1_weight * self._weighted_mse(out_d1, tgt_d1, weights)
+                if output_d2_weight > 0.0:
+                    loss = loss + output_d2_weight * self._weighted_mse(out_d2, tgt_d2, weights)
+                if fft_d1_weight > 0.0:
+                    loss = loss + fft_d1_weight * self._band_limited_fft_mse(
+                        out_d1,
+                        tgt_d1,
+                        low_ratio=fft_low_ratio,
+                        high_ratio=fft_high_ratio,
+                    )
+            return loss
+
         if alpha <= 0.0 and mae_weight <= 0.0:
             return criterion(outputs, targets)
 
+        # d1, d2 모두 사용: SharpFluctuationCalibrator._sharpness_score와 동일한 기준
         d1 = torch.zeros_like(targets)
         d1[:, 1:, :] = targets[:, 1:, :] - targets[:, :-1, :]
         d2 = torch.zeros_like(targets)
         d2[:, 1:, :] = d1[:, 1:, :] - d1[:, :-1, :]
 
-        sharp = d2.abs().detach()
-        sharp_scale = sharp.mean(dim=1, keepdim=True).clamp_min(1e-6)
-        sharp_score = sharp / sharp_scale
+        d1_scale = d1.abs().mean(dim=1, keepdim=True).clamp_min(1e-6)
+        d2_scale = d2.abs().mean(dim=1, keepdim=True).clamp_min(1e-6)
+        d1_norm = d1.abs() / d1_scale
+        d2_norm = d2.abs() / d2_scale
+
+        # 배치 내 상대 스케일 유지: 평균이 1인 점수로 정규화
+        raw_score = torch.sqrt(d1_norm.pow(2) + d2_norm.pow(2) + 1e-6)
+        sharp_score = raw_score / raw_score.mean(dim=1, keepdim=True).clamp_min(1e-6)
         max_weight = float(getattr(self.args, "som_sharp_loss_max_weight", 5.0))
-        weights = (1.0 + alpha * sharp_score).clamp(max=max_weight)
+        weights = (1.0 + alpha * sharp_score).clamp(max=max_weight).detach()
 
         err = outputs - targets
-        weighted_mse = (err.pow(2) * weights).sum() / weights.sum().clamp_min(1e-6)
+        # numel() 기준으로 나눠서 alpha 크기와 무관하게 loss 스케일 일정하게 유지
+        weighted_mse = (err.pow(2) * weights).sum() / weights.numel()
         loss = weighted_mse
         if mae_weight > 0.0:
-            weighted_mae = (err.abs() * weights).sum() / weights.sum().clamp_min(1e-6)
+            weighted_mae = (err.abs() * weights).sum() / weights.numel()
             loss = loss + mae_weight * weighted_mae
 
         return loss

@@ -242,6 +242,13 @@ class ShapeAwareSOM(nn.Module):
         modulation_init: float = 0.0,
         d2_weight: float = 1.0,
         sharpness_temperature: float = 1.0,
+        sharpness_mode: str = "heuristic",
+        sharpness_hidden_dim: int = 16,
+        sharpness_kernel_size: int = 3,
+        sharpness_d1_weight: float = 0.25,
+        sharpness_contrast_weight: float = 0.5,
+        sharpness_turn_weight: float = 0.5,
+        sharpness_contrast_window: int = 5,
         channel_wise: bool = True,
         eps: float = _EPS,
         **_,
@@ -259,6 +266,20 @@ class ShapeAwareSOM(nn.Module):
             raise ValueError("modulation_bound must be non-negative")
         if sharpness_temperature <= 0:
             raise ValueError("sharpness_temperature must be positive")
+        if sharpness_mode not in {"heuristic", "heatmap_cnn"}:
+            raise ValueError("sharpness_mode must be 'heuristic' or 'heatmap_cnn'")
+        if sharpness_hidden_dim < 1:
+            raise ValueError("sharpness_hidden_dim must be positive")
+        if sharpness_kernel_size < 1:
+            raise ValueError("sharpness_kernel_size must be positive")
+        if sharpness_d1_weight < 0:
+            raise ValueError("sharpness_d1_weight must be non-negative")
+        if sharpness_contrast_weight < 0:
+            raise ValueError("sharpness_contrast_weight must be non-negative")
+        if sharpness_turn_weight < 0:
+            raise ValueError("sharpness_turn_weight must be non-negative")
+        if sharpness_contrast_window < 1:
+            raise ValueError("sharpness_contrast_window must be positive")
 
         self.num_channels = int(num_channels)
         self.seq_len = int(seq_len)
@@ -269,11 +290,29 @@ class ShapeAwareSOM(nn.Module):
         self.modulation_bound = float(modulation_bound)
         self.d2_weight = float(d2_weight)
         self.sharpness_temperature = float(sharpness_temperature)
+        self.sharpness_mode = sharpness_mode
+        self.sharpness_hidden_dim = int(sharpness_hidden_dim)
+        self.sharpness_kernel_size = int(sharpness_kernel_size)
+        self.sharpness_d1_weight = float(sharpness_d1_weight)
+        self.sharpness_contrast_weight = float(sharpness_contrast_weight)
+        self.sharpness_turn_weight = float(sharpness_turn_weight)
+        self.sharpness_contrast_window = int(sharpness_contrast_window)
         self.channel_wise = bool(channel_wise)
         self.eps = eps
 
         self.derivative_weight = nn.Parameter(init_scale * torch.randn(num_channels, 2))
         self.heatmap_to_pred = nn.Conv1d(in_channels=seq_len, out_channels=pred_len, kernel_size=1)
+        padding = self.sharpness_kernel_size // 2
+        if self.sharpness_mode == "heatmap_cnn":
+            self.sharpness_net = nn.Sequential(
+                nn.Conv1d(2, self.sharpness_hidden_dim, kernel_size=self.sharpness_kernel_size, padding=padding),
+                nn.GELU(),
+                nn.Conv1d(self.sharpness_hidden_dim, self.sharpness_hidden_dim, kernel_size=self.sharpness_kernel_size, padding=padding),
+                nn.GELU(),
+                nn.Conv1d(self.sharpness_hidden_dim, 1, kernel_size=1),
+            )
+        else:
+            self.sharpness_net = None
 
         self.register_buffer("knot_centers", torch.linspace(0.0, 1.0, self.num_knots))
         param_shape = (self.num_knots, self.num_channels) if self.channel_wise else (self.num_knots, 1)
@@ -300,9 +339,19 @@ class ShapeAwareSOM(nn.Module):
         d2 = second_order_diff(x)
         d1_scale = d1.abs().mean(dim=1, keepdim=True).detach().clamp_min(self.eps)
         d2_scale = d2.abs().mean(dim=1, keepdim=True).detach().clamp_min(self.eps)
-        d1_norm = d1.abs() / d1_scale
-        d2_norm = d2.abs() / d2_scale
-        score = torch.sqrt(d1_norm.pow(2) + self.d2_weight * d2_norm.pow(2) + self.eps)
+        d1_norm = d1 / d1_scale
+        d2_norm = d2 / d2_scale
+
+        if self.sharpness_mode == "heatmap_cnn":
+            batch_size, seq_len, num_channels = d1_norm.shape
+            heatmap = torch.stack([d1_norm, d2_norm], dim=-1)
+            heatmap = heatmap.permute(0, 2, 3, 1).reshape(batch_size * num_channels, 2, seq_len)
+            logits = self.sharpness_net(heatmap)
+            sharpness = torch.sigmoid(logits / max(self.sharpness_temperature, self.eps))
+            sharpness = sharpness.reshape(batch_size, num_channels, seq_len).permute(0, 2, 1)
+            return d1, d2, sharpness
+
+        score = torch.sqrt(d1_norm.abs().pow(2) + self.d2_weight * d2_norm.abs().pow(2) + self.eps)
         sharpness = 1.0 - torch.exp(-score / max(self.sharpness_temperature, self.eps))
         return d1, d2, sharpness
 

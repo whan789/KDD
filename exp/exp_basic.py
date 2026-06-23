@@ -7,6 +7,7 @@ from utils.sharp_calibration import PostHocCalibration
 from utils.trend_calibration import PostHocTrendCalibration
 from utils.signed_spline_calibration import PostHocSignedSplineCalibration
 from utils.curvature_features import ShapeAwareSOMCalibration
+from utils.forecast_sharpening import DerivativeConditionedSharpeningCalibration
 from utils.prototype_derivative_som import PrototypeDerivativeSOMCalibration
 
 
@@ -50,6 +51,7 @@ class BackboneWithCalibration(nn.Module):
         if torch.is_tensor(outputs) and outputs.dim() == 3:
             x_context = args[0] if len(args) > 0 and torch.is_tensor(args[0]) and args[0].dim() == 3 else None
             calibrated, aux = self.som(outputs, x_context=x_context, return_params=True)
+            aux["backbone_output"] = outputs
             self.last_aux = aux
             return outputs, calibrated, aux
         self.last_aux = {}
@@ -189,6 +191,11 @@ class BackboneWithPrototypeDerivativeSOM(BackboneWithCalibration):
     calibrator_cls = PrototypeDerivativeSOMCalibration
     debug_label = "PROTOTYPE_DERIVATIVE"
 
+
+class BackboneWithDerivativeSharpening(BackboneWithCalibration):
+    calibrator_cls = DerivativeConditionedSharpeningCalibration
+    debug_label = "DERIVATIVE_SHARPENING"
+
 # Just put your model files under models/ folder
 # e.g., models/Transformer.py, models/LSTM.py, etc.
 # All models will be automatically detected and can be used by specifying their names.
@@ -216,6 +223,7 @@ class Exp_Basic(object):
                 "trend": BackboneWithTrend,
                 "signed_spline": BackboneWithSignedSpline,
                 "derivative": BackboneWithDerivativeSOM,
+                "derivative_sharpening": BackboneWithDerivativeSharpening,
                 "prototype_derivative": BackboneWithPrototypeDerivativeSOM,
             }
             wrapper_cls = wrapper_map.get(variant, BackboneWithSOM)
@@ -290,6 +298,26 @@ class Exp_Basic(object):
                 "d2_weight": getattr(self.args, "som_d2_weight", 1.0),
                 "sharpness_temperature": getattr(self.args, "som_sharpness_temperature", 1.0),
                 "channel_wise": True,
+                "eps": 1e-6,
+            }
+
+        if variant == "derivative_sharpening":
+            return {
+                "num_channels": num_channels,
+                "pred_len": getattr(self.args, "pred_len", None),
+                "hidden_dim": getattr(self.args, "som_derivative_hidden_dim", 16),
+                "kernel_size": getattr(self.args, "som_derivative_kernel_size", 3),
+                "correction_scale": getattr(self.args, "som_correction_scale", 1.0),
+                "num_knots": getattr(self.args, "som_num_knots", 8),
+                "spline_init_range": getattr(self.args, "som_spline_init_range", 0.3),
+                "spline_max_range": getattr(self.args, "som_spline_max_range", 5.0),
+                "learnable_knot_offsets": getattr(self.args, "som_learnable_knot_offsets", False),
+                "knot_offset_scale": getattr(self.args, "som_knot_offset_scale", 1.0),
+                "need_window": getattr(self.args, "som_need_window", 5),
+                "need_excursion_weight": getattr(self.args, "som_need_excursion_weight", 1.0),
+                "need_derivative_weight": getattr(self.args, "som_need_derivative_weight", 0.5),
+                "need_d2_weight": getattr(self.args, "som_need_d2_weight", 0.5),
+                "dropout": getattr(self.args, "dropout", 0.0),
                 "eps": 1e-6,
             }
 
@@ -455,4 +483,3 @@ class LazyModelDict(dict):
 
         self[key] = model_class
         return model_class
-

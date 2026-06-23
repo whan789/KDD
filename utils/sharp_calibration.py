@@ -4,405 +4,641 @@ import torch.nn.functional as F
 
 
 def finite_differences(x):
-    """
-    Compute first and second temporal finite differences with the same shape as x.
-
-    Args:
-        x: Tensor with shape [B, L, D].
-
-    Returns:
-        d1: First-order difference, shape [B, L, D].
-        d2: Second-order difference, shape [B, L, D].
-    """
     if x.dim() != 3:
         raise ValueError("Expected input shape [B, L, D].")
-
     d1 = torch.zeros_like(x)
     d1[:, 1:, :] = x[:, 1:, :] - x[:, :-1, :]
-
     d2 = torch.zeros_like(x)
     d2[:, 1:, :] = d1[:, 1:, :] - d1[:, :-1, :]
     return d1, d2
 
 
-class SharpFluctuationCalibrator(nn.Module):
+class ChannelWiseSpline1D(nn.Module):
+    def __init__(
+        self,
+        n_channels,
+        n_knots=8,
+        init_range=0.3,
+        max_range=5.0,
+        spline_type="linear",
+        learnable_knot_offsets=False,
+        knot_offset_scale=1.0,
+    ):
+        super().__init__()
+        if n_channels is None or n_channels < 1:
+            raise ValueError("n_channels must be a positive integer.")
+        if n_knots < 2:
+            raise ValueError("n_knots must be >= 2.")
+        if init_range <= 0:
+            raise ValueError("init_range must be positive.")
+        if max_range <= 0:
+            raise ValueError("max_range must be positive.")
+        if spline_type not in {"linear", "quadratic", "cubic"}:
+            raise ValueError("spline_type must be one of {'linear', 'quadratic', 'cubic'}.")
+        if knot_offset_scale < 0.0:
+            raise ValueError("knot_offset_scale must be non-negative.")
+
+        self.n_channels = int(n_channels)
+        self.n_knots = int(n_knots)
+        self.max_range = float(max_range)
+        self.spline_type = spline_type
+        self.learnable_knot_offsets = bool(learnable_knot_offsets)
+        self.knot_offset_scale = float(knot_offset_scale)
+
+        base_knots = torch.linspace(-1.0, 1.0, self.n_knots)
+        self.register_buffer("base_knots", base_knots)
+        self.range_param = nn.Parameter(torch.ones(self.n_channels) * float(init_range))
+
+        if self.learnable_knot_offsets:
+            # Raw knot-step logits. We transform these into positive increments
+            # and take a cumulative sum in forward() so knot order is preserved.
+            self.knot_offsets = nn.Parameter(torch.zeros(self.n_channels, self.n_knots - 1))
+        else:
+            self.register_parameter("knot_offsets", None)
+
+        if self.spline_type == "linear":
+            self.n_basis = self.n_knots
+        elif self.spline_type == "quadratic":
+            self.n_basis = self.n_knots + 3
+        else:
+            self.n_basis = self.n_knots + 4
+
+        self.weight = nn.Parameter(torch.zeros(self.n_channels, self.n_basis))
+        nn.init.normal_(self.weight, mean=0.0, std=0.01)
+
+    def forward(
+        self,
+        y,
+        weight_delta=None,
+        range_delta=None,
+        knot_offset_delta=None,
+        modulation_scale=1.0,
+    ):
+        if y.dim() != 3:
+            raise ValueError("Expected y shape [B, L, D].")
+        batch_size, _, d = y.shape
+        if d != self.n_channels:
+            raise ValueError(f"Channel mismatch: expected {self.n_channels}, got {d}.")
+
+        modulation_scale = float(modulation_scale)
+        if modulation_scale < 0.0:
+            raise ValueError("modulation_scale must be non-negative.")
+
+        seq_len = y.size(1)
+        range_raw = self.range_param.view(1, 1, d).expand(batch_size, seq_len, -1)
+        if range_delta is not None:
+            if range_delta.shape == (batch_size, d):
+                range_delta = range_delta.unsqueeze(1).expand(-1, seq_len, -1)
+            elif range_delta.shape != (batch_size, seq_len, d):
+                raise ValueError(
+                    f"range_delta must have shape {(batch_size, d)} or {(batch_size, seq_len, d)}, got {tuple(range_delta.shape)}."
+                )
+            range_raw = range_raw + modulation_scale * torch.tanh(range_delta)
+        range_d = F.softplus(range_raw)
+        range_d = torch.clamp(range_d, max=self.max_range)
+        base_knots = self.base_knots.view(1, 1, 1, self.n_knots) * range_d.view(batch_size, seq_len, d, 1)
+        if self.learnable_knot_offsets:
+            knot_steps_raw = self.knot_offsets.view(1, 1, d, self.n_knots - 1).expand(batch_size, seq_len, -1, -1)
+            if knot_offset_delta is not None:
+                if knot_offset_delta.shape == (batch_size, d, self.n_knots - 1):
+                    knot_offset_delta = knot_offset_delta.unsqueeze(1).expand(-1, seq_len, -1, -1)
+                elif knot_offset_delta.shape != (batch_size, seq_len, d, self.n_knots - 1):
+                    raise ValueError(
+                        "knot_offset_delta must have shape "
+                        f"{(batch_size, d, self.n_knots - 1)} or {(batch_size, seq_len, d, self.n_knots - 1)}, got {tuple(knot_offset_delta.shape)}."
+                    )
+                knot_steps_raw = knot_steps_raw + modulation_scale * torch.tanh(knot_offset_delta)
+            knot_steps = F.softplus(knot_steps_raw).view(batch_size, seq_len, d, self.n_knots - 1)
+            knot_steps = knot_steps / knot_steps.mean(dim=-1, keepdim=True).clamp_min(1e-6)
+            knot_steps = knot_steps * (
+                2.0 * range_d.view(batch_size, seq_len, d, 1) / max(self.n_knots - 1, 1)
+            ) * self.knot_offset_scale
+            knot_offsets = torch.cumsum(knot_steps, dim=-1)
+            knot_offsets = F.pad(knot_offsets, (1, 0), mode="constant", value=0.0)
+            knot_offsets = knot_offsets - knot_offsets.mean(dim=-1, keepdim=True)
+            knots = base_knots + knot_offsets
+        else:
+            knots = base_knots
+        y_expanded = y.unsqueeze(-1)
+
+        if self.spline_type == "linear":
+            basis = F.relu(y_expanded - knots)
+        elif self.spline_type == "quadratic":
+            poly_basis = torch.cat(
+                [
+                    torch.ones_like(y_expanded),
+                    y_expanded,
+                    y_expanded.pow(2),
+                ],
+                dim=-1,
+            )
+            quad_hinge = F.relu(y_expanded - knots).pow(2)
+            basis = torch.cat([poly_basis, quad_hinge], dim=-1)
+        else:
+            poly_basis = torch.cat(
+                [
+                    torch.ones_like(y_expanded),
+                    y_expanded,
+                    y_expanded.pow(2),
+                    y_expanded.pow(3),
+                ],
+                dim=-1,
+            )
+            cubic_hinge = F.relu(y_expanded - knots).pow(3)
+            basis = torch.cat([poly_basis, cubic_hinge], dim=-1)
+
+        weight = self.weight.view(1, 1, d, self.n_basis).expand(batch_size, seq_len, -1, -1)
+        if weight_delta is not None:
+            if weight_delta.shape == (batch_size, d, self.n_basis):
+                weight_delta = weight_delta.unsqueeze(1).expand(-1, seq_len, -1, -1)
+            elif weight_delta.shape != (batch_size, seq_len, d, self.n_basis):
+                raise ValueError(
+                    f"weight_delta must have shape {(batch_size, d, self.n_basis)} or {(batch_size, seq_len, d, self.n_basis)}, got {tuple(weight_delta.shape)}."
+                )
+            weight = weight + modulation_scale * torch.tanh(weight_delta)
+        return torch.sum(basis * weight, dim=-1)
+
+
+class ValueSplineCalibrator(nn.Module):
     """
-    Post-hoc calibration module for over-smoothed time-series forecasts.
+    Post-hoc spline calibration module for SOM (SCINet) output.
 
-    The module receives a backbone prediction y_hat with shape [B, L, D] and
-    returns a calibrated prediction with the same shape. It uses first and
-    second finite differences to detect local dynamic context, then maps the
-    resulting sharpness score through knot-wise triangular basis functions.
-
-    Normal regions can learn small gamma/beta values, while sharp regions can
-    learn larger local correction parameters.
+    Usage with SCINet:
+        calibrator = ValueSplineCalibrator(num_channels=enc_in, ...)
+        # y_hat: SCINet raw output [B, pred_len, D]
+        # x_context: original encoder input [B, seq_len, D] (optional)
+        calibrated = calibrator(y_hat, x_context=x_enc)
     """
 
     def __init__(
         self,
         num_knots=8,
-        gamma_bound=0.5,
-        beta_bound=0.25,
-        gamma_init=-4.0,
-        beta_init=0.0,
-        grid_width=0.25,
-        learnable_grid=True,
-        moving_avg_kernel=3,
-        d2_weight=1.0,
-        sharpness_temperature=1.0,
-        adaptive_grid=True,
-        adaptive_grid_sharpness=1.0,
-        adaptive_grid_min_scale=0.5,
-        adaptive_grid_max_scale=1.0,
-        use_input_context=True,
-        input_context_weight=0.5,
-        use_mlp_head=True,
-        residual_head_type="mlp",
-        mlp_hidden_dim=64,
-        mlp_num_layers=2,
-        mlp_dropout=0.0,
-        mlp_kernel_size=5,
-        residual_sharp_boost=0.0,
-        mlp_width_scale_bound=1.0,
-        horizon_decay_floor=1.0,
-        horizon_decay_power=1.0,
-        use_dynamics_gate=False,
-        dynamics_gate_init=0.5,
-        dynamics_gate_floor=0.0,
-        channel_wise=False,
         num_channels=None,
+        spline_init_range=0.3,
+        spline_max_range=5.0,
+        spline_type="linear",
+
+        learnable_knot_offsets=False,
+        knot_offset_scale=1.0,
+        use_sharpness_gate=False,
+        use_error_aware_gate=False,
+        error_gate_hidden_dim=16,
+        error_gate_kernel_size=3,
+        error_gate_max_boost=1.0,
+        error_gate_temperature=1.0,
+        sharpness_gate_floor=0.0,
+        sharpness_gate_power=1.0,
+        sharpness_d2_weight=1.0,
+        sharpness_temperature=1.0,
+        use_sharp_residual=False,
+        sharp_residual_hidden_dim=16,
+        sharp_residual_kernel_size=3,
+        sharp_residual_scale=0.25,
+        use_context_spline=False,
+        context_spline_attention_dim=32,
+        context_spline_num_heads=4,
+        context_spline_ff_hidden_dim=64,
+        context_spline_modulation_scale=0.5,
         eps=1e-6,
+        **_,
     ):
-        super(SharpFluctuationCalibrator, self).__init__()
+        super().__init__()
+        if sharpness_gate_floor < 0.0 or sharpness_gate_floor > 1.0:
+            raise ValueError("sharpness_gate_floor must be in [0, 1].")
+        if sharpness_gate_power <= 0.0:
+            raise ValueError("sharpness_gate_power must be positive.")
+        if sharpness_d2_weight < 0.0:
+            raise ValueError("sharpness_d2_weight must be non-negative.")
+        if sharpness_temperature <= 0.0:
+            raise ValueError("sharpness_temperature must be positive.")
+        if sharp_residual_hidden_dim < 1:
+            raise ValueError("sharp_residual_hidden_dim must be positive.")
+        if sharp_residual_kernel_size < 1 or sharp_residual_kernel_size % 2 == 0:
+            raise ValueError("sharp_residual_kernel_size must be a positive odd integer.")
+        if sharp_residual_scale < 0.0:
+            raise ValueError("sharp_residual_scale must be non-negative.")
+        if context_spline_attention_dim < 1:
+            raise ValueError("context_spline_attention_dim must be positive.")
+        if context_spline_num_heads < 1:
+            raise ValueError("context_spline_num_heads must be positive.")
+        if context_spline_attention_dim % context_spline_num_heads != 0:
+            raise ValueError("context_spline_attention_dim must be divisible by context_spline_num_heads.")
+        if context_spline_ff_hidden_dim < 1:
+            raise ValueError("context_spline_ff_hidden_dim must be positive.")
+        if context_spline_modulation_scale < 0.0:
+            raise ValueError("context_spline_modulation_scale must be non-negative.")
+        if error_gate_hidden_dim < 1:
+            raise ValueError("error_gate_hidden_dim must be positive.")
+        if error_gate_kernel_size < 1 or error_gate_kernel_size % 2 == 0:
+            raise ValueError("error_gate_kernel_size must be a positive odd integer.")
+        if error_gate_max_boost < 0.0:
+            raise ValueError("error_gate_max_boost must be non-negative.")
+        if error_gate_temperature <= 0.0:
+            raise ValueError("error_gate_temperature must be positive.")
 
-        if num_knots < 2:
-            raise ValueError("num_knots must be >= 2.")
-        if grid_width <= 0:
-            raise ValueError("grid_width must be positive.")
-        if moving_avg_kernel < 1 or moving_avg_kernel % 2 == 0:
-            raise ValueError("moving_avg_kernel must be a positive odd integer.")
-        if adaptive_grid_sharpness < 0:
-            raise ValueError("adaptive_grid_sharpness must be >= 0.")
-        if adaptive_grid_min_scale <= 0 or adaptive_grid_max_scale <= 0:
-            raise ValueError("adaptive_grid_min_scale and adaptive_grid_max_scale must be positive.")
-        if adaptive_grid_min_scale > adaptive_grid_max_scale:
-            raise ValueError("adaptive_grid_min_scale must be <= adaptive_grid_max_scale.")
-        if input_context_weight < 0 or input_context_weight > 1:
-            raise ValueError("input_context_weight must be in [0, 1].")
-        if residual_head_type not in ("mlp", "conv"):
-            raise ValueError("residual_head_type must be either mlp or conv.")
-        if mlp_num_layers < 1:
-            raise ValueError("mlp_num_layers must be >= 1.")
-        if mlp_hidden_dim < 1:
-            raise ValueError("mlp_hidden_dim must be >= 1.")
-        if mlp_kernel_size < 1 or mlp_kernel_size % 2 == 0:
-            raise ValueError("mlp_kernel_size must be a positive odd integer.")
-        if residual_sharp_boost < 0:
-            raise ValueError("residual_sharp_boost must be >= 0.")
-        if mlp_width_scale_bound <= 0:
-            raise ValueError("mlp_width_scale_bound must be positive.")
-        if horizon_decay_floor <= 0 or horizon_decay_floor > 1:
-            raise ValueError("horizon_decay_floor must be in (0, 1].")
-        if horizon_decay_power <= 0:
-            raise ValueError("horizon_decay_power must be positive.")
-        if dynamics_gate_init <= 0 or dynamics_gate_init >= 1:
-            raise ValueError("dynamics_gate_init must be in (0, 1).")
-        if dynamics_gate_floor < 0 or dynamics_gate_floor >= 1:
-            raise ValueError("dynamics_gate_floor must be in [0, 1).")
-        if channel_wise and num_channels is None:
-            raise ValueError("num_channels is required when channel_wise=True.")
-
-        self.num_knots = num_knots
-        self.gamma_bound = gamma_bound
-        self.beta_bound = beta_bound
-        self.moving_avg_kernel = moving_avg_kernel
-        self.d2_weight = d2_weight
-        self.sharpness_temperature = sharpness_temperature
-        self.adaptive_grid = adaptive_grid
-        self.adaptive_grid_sharpness = adaptive_grid_sharpness
-        self.adaptive_grid_min_scale = adaptive_grid_min_scale
-        self.adaptive_grid_max_scale = adaptive_grid_max_scale
-        self.use_input_context = use_input_context
-        self.input_context_weight = input_context_weight
-        self.use_mlp_head = use_mlp_head
-        self.residual_head_type = residual_head_type
-        self.mlp_kernel_size = mlp_kernel_size
-        self.residual_sharp_boost = residual_sharp_boost
-        self.mlp_residual_bound = mlp_width_scale_bound
-        self.horizon_decay_floor = horizon_decay_floor
-        self.horizon_decay_power = horizon_decay_power
-        self.horizon_decay_ref_len = 720
-        self.horizon_decay_length_power = 1.5
-        self.use_dynamics_gate = use_dynamics_gate
-        self.dynamics_gate_floor = dynamics_gate_floor
-        self.channel_wise = channel_wise
-        self.num_channels = num_channels
-        self.eps = eps
-
-        centers = torch.linspace(0.0, 1.0, num_knots)
-        self.register_buffer("knot_centers", centers)
-
-        width = torch.full((num_knots,), float(grid_width))
-        if learnable_grid:
-            self.log_grid_width = nn.Parameter(torch.log(width))
+        self.eps = float(eps)
+        self.use_sharpness_gate = bool(use_sharpness_gate)
+        self.use_error_aware_gate = bool(use_error_aware_gate)
+        self.spline_type = spline_type
+        self.learnable_knot_offsets = bool(learnable_knot_offsets)
+        self.knot_offset_scale = float(knot_offset_scale)
+        self.sharpness_gate_floor = float(sharpness_gate_floor)
+        self.sharpness_gate_power = float(sharpness_gate_power)
+        self.sharpness_d2_weight = float(sharpness_d2_weight)
+        self.sharpness_temperature = float(sharpness_temperature)
+        self.use_sharp_residual = bool(use_sharp_residual)
+        self.sharp_residual_scale = float(sharp_residual_scale)
+        self.use_context_spline = bool(use_context_spline)
+        self.context_spline_attention_dim = int(context_spline_attention_dim)
+        self.context_spline_num_heads = int(context_spline_num_heads)
+        self.context_spline_ff_hidden_dim = int(context_spline_ff_hidden_dim)
+        self.context_spline_modulation_scale = float(context_spline_modulation_scale)
+        self.error_gate_hidden_dim = int(error_gate_hidden_dim)
+        self.error_gate_kernel_size = int(error_gate_kernel_size)
+        self.error_gate_max_boost = float(error_gate_max_boost)
+        self.error_gate_temperature = float(error_gate_temperature)
+        self.spline = ChannelWiseSpline1D(
+            n_channels=num_channels,
+            n_knots=num_knots,
+            init_range=spline_init_range,
+            max_range=spline_max_range,
+            spline_type=spline_type,
+            learnable_knot_offsets=learnable_knot_offsets,
+            knot_offset_scale=knot_offset_scale,
+        )
+        # [개선 2] correction 크기 제한 — 학습 초기 폭발 방지
+        self.correction_scale = nn.Parameter(torch.ones(1) * 0.1)
+        # [개선 3] temporal mixing — depthwise conv로 인접 시점 정보 혼합
+        self.temporal_mix = nn.Conv1d(
+            num_channels, num_channels,
+            kernel_size=3, padding=1, groups=num_channels, bias=False,
+        )
+        nn.init.dirac_(self.temporal_mix.weight)   # identity 초기화 → 학습 전 동작 보존
+        if self.use_context_spline:
+            self.context_spline_query_in = nn.Linear(3 * num_channels, self.context_spline_attention_dim)
+            self.context_spline_key_value_in = nn.Linear(3 * num_channels, self.context_spline_attention_dim)
+            self.context_spline_attention = nn.MultiheadAttention(
+                embed_dim=self.context_spline_attention_dim,
+                num_heads=self.context_spline_num_heads,
+                batch_first=True,
+            )
+            self.context_spline_ff = nn.Sequential(
+                nn.Linear(self.context_spline_attention_dim, self.context_spline_ff_hidden_dim),
+                nn.GELU(),
+                nn.Linear(self.context_spline_ff_hidden_dim, self.context_spline_attention_dim),
+            )
+            self.context_spline_norm1 = nn.LayerNorm(self.context_spline_attention_dim)
+            self.context_spline_norm2 = nn.LayerNorm(self.context_spline_attention_dim)
+            self.context_spline_weight_out = nn.Linear(self.context_spline_attention_dim, num_channels * self.spline.n_basis)
+            self.context_spline_range_out = nn.Linear(self.context_spline_attention_dim, num_channels)
+            if self.learnable_knot_offsets:
+                self.context_spline_knot_out = nn.Linear(
+                    self.context_spline_attention_dim,
+                    num_channels * (num_knots - 1),
+                )
+            else:
+                self.context_spline_knot_out = None
         else:
-            self.register_buffer("log_grid_width", torch.log(width))
-
-        param_shape = (num_knots, num_channels) if channel_wise else (num_knots, 1)
-        self.gamma_logits = nn.Parameter(torch.full(param_shape, float(gamma_init)))
-        self.beta_logits = nn.Parameter(torch.full(param_shape, float(beta_init)))
-
-        gate_shape = (num_channels,) if (channel_wise and num_channels is not None) else (1,)
-        gate_bias = torch.full(gate_shape, torch.logit(torch.tensor(float(dynamics_gate_init))))
-        self.dynamics_gate_bias = nn.Parameter(gate_bias)
-        self.dynamics_gate_scale = nn.Parameter(torch.ones(gate_shape))
-
-        # Residual head. The mlp mode reproduces the best point-wise residual setup.
-        self.mlp_in_dim = 9
-        mlp_layers = []
-        in_dim = self.mlp_in_dim
-        if self.residual_head_type == "conv":
-            padding = mlp_kernel_size // 2
-            for _ in range(max(mlp_num_layers - 1, 0)):
-                mlp_layers.append(nn.Conv1d(in_dim, mlp_hidden_dim, kernel_size=mlp_kernel_size, padding=padding))
-                mlp_layers.append(nn.GELU())
-                if mlp_dropout > 0:
-                    mlp_layers.append(nn.Dropout(mlp_dropout))
-                in_dim = mlp_hidden_dim
-            mlp_layers.append(nn.Conv1d(in_dim, 1, kernel_size=mlp_kernel_size, padding=padding))
+            self.context_spline_query_in = None
+            self.context_spline_key_value_in = None
+            self.context_spline_attention = None
+            self.context_spline_ff = None
+            self.context_spline_norm1 = None
+            self.context_spline_norm2 = None
+            self.context_spline_weight_out = None
+            self.context_spline_range_out = None
+            self.context_spline_knot_out = None
+        if self.use_error_aware_gate:
+            padding = error_gate_kernel_size // 2
+            self.error_gate_in = nn.Conv1d(
+                3 * num_channels, self.error_gate_hidden_dim * num_channels,
+                kernel_size=error_gate_kernel_size, padding=padding,
+                groups=num_channels, bias=True,
+            )
+            self.error_gate_mid = nn.Conv1d(
+                self.error_gate_hidden_dim * num_channels, self.error_gate_hidden_dim * num_channels,
+                kernel_size=error_gate_kernel_size, padding=padding,
+                groups=num_channels, bias=True,
+            )
+            self.error_gate_out = nn.Conv1d(
+                self.error_gate_hidden_dim * num_channels, num_channels,
+                kernel_size=1, groups=num_channels, bias=True,
+            )
         else:
-            for _ in range(max(mlp_num_layers - 1, 0)):
-                mlp_layers.append(nn.Linear(in_dim, mlp_hidden_dim))
-                mlp_layers.append(nn.GELU())
-                if mlp_dropout > 0:
-                    mlp_layers.append(nn.Dropout(mlp_dropout))
-                in_dim = mlp_hidden_dim
-            mlp_layers.append(nn.Linear(in_dim, 1))
-        self.mlp_head = nn.Sequential(*mlp_layers)
+            self.error_gate_in = None
+            self.error_gate_mid = None
+            self.error_gate_out = None
 
-    def _temporal_moving_average(self, x):
-        if self.moving_avg_kernel == 1:
-            return x
+        if self.use_sharp_residual:
+            padding = sharp_residual_kernel_size // 2
+            # [개선 4] 채널별 독립 conv — 각 채널이 자신만의 가중치로 패턴 학습
+            # grouped conv: input channel 축을 [2*D], [H*D], [D] 로 구성하고
+            # groups=D 로 묶으면 채널 간 가중치 공유가 완전히 사라짐
+            self.sharp_residual_in = nn.Conv1d(
+                2 * num_channels, sharp_residual_hidden_dim * num_channels,
+                kernel_size=sharp_residual_kernel_size, padding=padding,
+                groups=num_channels, bias=True,
+            )
+            self.sharp_residual_mid = nn.Conv1d(
+                sharp_residual_hidden_dim * num_channels, sharp_residual_hidden_dim * num_channels,
+                kernel_size=sharp_residual_kernel_size, padding=padding,
+                groups=num_channels, bias=True,
+            )
+            self.sharp_residual_out = nn.Conv1d(
+                sharp_residual_hidden_dim * num_channels, num_channels,
+                kernel_size=1, groups=num_channels, bias=True,
+            )
+            self._sharp_hidden = sharp_residual_hidden_dim
+            self._num_channels = num_channels
+        else:
+            self.sharp_residual_in = None
+            self.sharp_residual_mid = None
+            self.sharp_residual_out = None
 
-        padding = self.moving_avg_kernel // 2
-        x_t = x.permute(0, 2, 1)
-        x_t = F.pad(x_t, (padding, padding), mode="replicate")
-        trend = F.avg_pool1d(x_t, kernel_size=self.moving_avg_kernel, stride=1)
-        return trend.permute(0, 2, 1)
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-    def _sharpness_score(self, d1, d2):
-        d1_scale = d1.abs().mean(dim=1, keepdim=True).detach() + self.eps
-        d2_scale = d2.abs().mean(dim=1, keepdim=True).detach() + self.eps
+    def _normalize(self, x):
+        """Returns (z, mean, std) where z = (x - mean) / std.
+        mean/std are computed over the time axis and detached from the graph.
+        """
+        means = x.mean(dim=1, keepdim=True).detach()
+        centered = x - means
+        stdev = torch.sqrt(
+            torch.var(centered, dim=1, keepdim=True, unbiased=False) + 1e-5
+        ).detach().clamp_min(self.eps)
+        return (x - means) / stdev, means, stdev
 
+    def _compute_sharpness(self, z):
+        """Compute per-position sharpness score from a *normalized* signal z.
+
+        Returns (sharpness, d1, d2).  d1/d2 are the raw finite differences
+        (before normalisation) and are reused by _compute_sharp_residual to
+        avoid a second call to finite_differences.
+        """
+        d1, d2 = finite_differences(z)
+        d1_scale = d1.abs().mean(dim=1, keepdim=True).detach().clamp_min(self.eps)
+        d2_scale = d2.abs().mean(dim=1, keepdim=True).detach().clamp_min(self.eps)
         d1_norm = d1.abs() / d1_scale
         d2_norm = d2.abs() / d2_scale
-        score = torch.sqrt(d1_norm.pow(2) + self.d2_weight * d2_norm.pow(2) + self.eps)
+        score = torch.sqrt(d1_norm.pow(2) + self.sharpness_d2_weight * d2_norm.pow(2) + self.eps)
+        sharpness = 1.0 - torch.exp(-score / self.sharpness_temperature)
+        return sharpness, d1, d2
 
-        temperature = max(float(self.sharpness_temperature), self.eps)
-        return 1.0 - torch.exp(-score / temperature)
-
-    def _resize_time_length(self, x, target_len):
-        if x.size(1) == target_len:
-            return x
-        x_t = x.permute(0, 2, 1)
-        x_t = F.interpolate(x_t, size=target_len, mode="linear", align_corners=False)
-        return x_t.permute(0, 2, 1)
-
-    def _input_context_dynamics(self, target_len, x_context):
-        if (not self.use_input_context) or x_context is None or x_context.dim() != 3:
-            return None
-
-        x_tail = x_context[:, -target_len:, :]
-        x_tail = self._resize_time_length(x_tail, target_len)
-        x_d1, x_d2 = finite_differences(x_tail)
-        x_trend = self._temporal_moving_average(x_tail)
-        x_local_deviation = x_tail - x_trend
-        x_sharpness = self._sharpness_score(x_d1, x_d2)
-        return {
-            "x_sharpness": x_sharpness,
-            "x_d1": x_d1,
-            "x_d2": x_d2,
-            "x_local_deviation": x_local_deviation,
-        }
-
-    def _merge_input_context_sharpness(self, y_sharpness, x_context, x_dynamics=None):
-        if x_dynamics is None:
-            x_dynamics = self._input_context_dynamics(y_sharpness.size(1), x_context)
-        if x_dynamics is None:
-            return y_sharpness, None
-        x_sharpness = x_dynamics["x_sharpness"]
-
-        weight = float(self.input_context_weight)
-        merged = (1.0 - weight) * y_sharpness + weight * x_sharpness
-        return merged, x_sharpness
-
-    def _knot_basis(self, sharpness):
-        centers = self.knot_centers.view(1, 1, 1, self.num_knots)
-        base_widths = self.log_grid_width.exp().clamp_min(self.eps).view(1, 1, 1, self.num_knots)
-
-        widths = base_widths
-        if self.adaptive_grid:
-            # Sharper regions use narrower local widths to form steeper local basis curves.
-            width_scale = 1.0 / (1.0 + self.adaptive_grid_sharpness * sharpness.unsqueeze(-1))
-            width_scale = width_scale.clamp(self.adaptive_grid_min_scale, self.adaptive_grid_max_scale)
-            widths = (base_widths * width_scale).clamp_min(self.eps)
-
-        basis = F.relu(1.0 - (sharpness.unsqueeze(-1) - centers).abs() / widths)
-        basis_sum = basis.sum(dim=-1, keepdim=True).clamp_min(self.eps)
-        return basis / basis_sum, widths
-
-    def _compute_dynamics_gate(self, sharpness):
-        gate_bias = self.dynamics_gate_bias.view(1, 1, -1)
-        gate_scale = self.dynamics_gate_scale.view(1, 1, -1)
-        gate_logits = gate_scale * sharpness + gate_bias
-        gate = torch.sigmoid(gate_logits)
-        if self.dynamics_gate_floor > 0.0:
-            gate = self.dynamics_gate_floor + (1.0 - self.dynamics_gate_floor) * gate
+    def _compute_sharpness_gate(self, sharpness):
+        gate = (1.0 - sharpness).clamp(0.0, 1.0)
+        if self.sharpness_gate_power != 1.0:
+            gate = gate.pow(self.sharpness_gate_power)
+        if self.sharpness_gate_floor > 0.0:
+            gate = self.sharpness_gate_floor + (1.0 - self.sharpness_gate_floor) * gate
         return gate
 
-    def _predict_residual_with_mlp(self, y_hat, d1, d2, local_deviation, sharpness, x_dynamics):
-        if x_dynamics is None:
-            x_sharpness = torch.zeros_like(sharpness)
-            x_d1 = torch.zeros_like(d1)
-            x_d2 = torch.zeros_like(d2)
-            x_local_deviation = torch.zeros_like(local_deviation)
-        else:
-            x_sharpness = x_dynamics["x_sharpness"]
-            x_d1 = x_dynamics["x_d1"]
-            x_d2 = x_dynamics["x_d2"]
-            x_local_deviation = x_dynamics["x_local_deviation"]
-        feats = torch.stack([
-            y_hat, d1, d2, local_deviation, sharpness, x_sharpness,
-            x_d1, x_d2, x_local_deviation,
-        ], dim=-1)
-        b, l, c, f = feats.shape
-        if self.residual_head_type == "conv":
-            conv_in = feats.permute(0, 2, 3, 1).reshape(b * c, f, l)
-            residual_logits = self.mlp_head(conv_in).reshape(b, c, l).permute(0, 2, 1)
-        else:
-            residual_logits = self.mlp_head(feats.reshape(-1, f)).reshape(b, l, c)
+    def _compute_error_aware_gate(self, gate_z, d1, d2):
+        """Predict an error-aware amplification gate from observable features.
 
-        local_scale = (
-            local_deviation.abs().detach()
-            + d1.abs().detach()
-            + d2.abs().detach()
-        ) / 3.0
-        global_scale = y_hat.detach().abs().mean(dim=1, keepdim=True).clamp_min(self.eps)
-        sharp_gate = sharpness.detach()
-        residual_scale = (local_scale + global_scale) * sharp_gate
-        residual_scale = residual_scale * (1.0 + self.residual_sharp_boost * sharp_gate)
-        return self.mlp_residual_bound * torch.tanh(residual_logits) * residual_scale
+        The gate is shaped as a positive scale in [1, 1 + max_boost].
+        """
+        batch_size, seq_len, num_channels = gate_z.shape
+        d1_scale = d1.abs().mean(dim=1, keepdim=True).detach().clamp_min(self.eps)
+        d2_scale = d2.abs().mean(dim=1, keepdim=True).detach().clamp_min(self.eps)
+        d1_norm = d1 / d1_scale
+        d2_norm = d2 / d2_scale
 
-    def _project_params(self, basis, channels):
-        if self.channel_wise and channels != self.num_channels:
-            raise ValueError(
-                "Input channel size does not match num_channels: "
-                f"{channels} vs {self.num_channels}."
-            )
+        features = torch.stack([gate_z, d1_norm, d2_norm], dim=2)  # [B, L, 3, D]
+        features = features.permute(0, 3, 2, 1).reshape(batch_size, 3 * num_channels, seq_len)
+        x = F.gelu(self.error_gate_in(features))
+        x = F.gelu(self.error_gate_mid(x))
+        logits = self.error_gate_out(x)
+        gate = 1.0 + self.error_gate_max_boost * torch.sigmoid(logits / self.error_gate_temperature)
+        return gate.permute(0, 2, 1)
 
-        gamma_table = self.gamma_bound * torch.sigmoid(self.gamma_logits)
-        beta_table = self.beta_bound * torch.tanh(self.beta_logits)
+    def _compute_sharp_residual(self, gate_z, d1, d2, sharpness):
+        """Compute sharp residual with fully channel-wise independent convolutions.
 
-        if self.channel_wise:
-            gamma = (basis * gamma_table.t().view(1, 1, channels, self.num_knots)).sum(dim=-1)
-            beta = (basis * beta_table.t().view(1, 1, channels, self.num_knots)).sum(dim=-1)
-        else:
-            gamma = torch.einsum("blck,kd->blcd", basis, gamma_table)
-            beta = torch.einsum("blck,kd->blcd", basis, beta_table)
-            gamma = gamma.squeeze(-1)
-            beta = beta.squeeze(-1)
-        return gamma, beta
+        Layout: interleave d1/d2 per channel so grouped conv sees
+        [d1_ch0, d2_ch0, d1_ch1, d2_ch1, ...] → groups=D keeps channels separate.
+        """
+        batch_size, seq_len, num_channels = gate_z.shape
+        d1_scale = d1.abs().mean(dim=1, keepdim=True).detach().clamp_min(self.eps)
+        d2_scale = d2.abs().mean(dim=1, keepdim=True).detach().clamp_min(self.eps)
+        d1_norm = d1 / d1_scale   # [B, L, D]
+        d2_norm = d2 / d2_scale   # [B, L, D]
+
+        # interleave: [B, 2*D, L]  (채널 c → index 2c, 2c+1)
+        d_interleaved = torch.stack([d1_norm, d2_norm], dim=2)   # [B, L, 2, D]
+        d_interleaved = d_interleaved.permute(0, 3, 2, 1)        # [B, D, 2, L]
+        heatmap = d_interleaved.reshape(batch_size, 2 * num_channels, seq_len)  # [B, 2D, L]
+
+        x = F.gelu(self.sharp_residual_in(heatmap))   # [B, H*D, L]
+        x = F.gelu(self.sharp_residual_mid(x))        # [B, H*D, L]
+        logits = self.sharp_residual_out(x)            # [B, D, L]
+
+        residual = logits.permute(0, 2, 1)             # [B, L, D]
+        residual = torch.tanh(residual) * sharpness
+        residual = residual - residual.mean(dim=1, keepdim=True)
+        return self.sharp_residual_scale * residual
+
+    def _compute_context_spline_modulation(self, x_context, z):
+        batch_size, pred_len, num_channels = z.shape
+        context_z, _, _ = self._normalize(x_context)
+        ctx_d1, ctx_d2 = finite_differences(context_z)
+        pred_d1, pred_d2 = finite_differences(z)
+
+        context_features = torch.cat([context_z, ctx_d1, ctx_d2], dim=-1)
+        query_features = torch.cat([z, pred_d1, pred_d2], dim=-1)
+
+        context_tokens = self.context_spline_key_value_in(context_features)
+        query_tokens = self.context_spline_query_in(query_features)
+
+        attended, attention_weights = self.context_spline_attention(
+            query=query_tokens,
+            key=context_tokens,
+            value=context_tokens,
+            need_weights=True,
+            average_attn_weights=False,
+        )
+        attended = self.context_spline_norm1(query_tokens + attended)
+        attended = self.context_spline_norm2(attended + self.context_spline_ff(attended))
+
+        weight_delta = self.context_spline_weight_out(attended)
+        weight_delta = weight_delta.view(batch_size, pred_len, num_channels, self.spline.n_basis)
+
+        range_delta = self.context_spline_range_out(attended)
+        range_delta = range_delta.view(batch_size, pred_len, num_channels)
+
+        knot_offset_delta = None
+        if self.context_spline_knot_out is not None:
+            knot_offset_delta = self.context_spline_knot_out(attended)
+            knot_offset_delta = knot_offset_delta.view(batch_size, pred_len, num_channels, self.spline.n_knots - 1)
+
+        return {
+            "weight_delta": weight_delta,
+            "range_delta": range_delta,
+            "knot_offset_delta": knot_offset_delta,
+            "context_z": context_z,
+            "context_d1": ctx_d1,
+            "context_d2": ctx_d2,
+            "attention_map": attention_weights.mean(dim=1),
+        }
+
+    @staticmethod
+    def _match_seq_len(tensor, target_len):
+        """Interpolate tensor from its current seq-len to target_len if needed."""
+        if tensor.size(1) == target_len:
+            return tensor
+        return F.interpolate(
+            tensor.permute(0, 2, 1),
+            size=target_len,
+            mode="linear",
+            align_corners=False,
+        ).permute(0, 2, 1)
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
     def forward(self, y_hat, x_context=None, return_params=False):
         """
         Args:
-            y_hat: Backbone prediction, shape [B, L, D].
-            return_params: If True, also return gamma, beta, sharpness, d1, d2.
+            y_hat      : model prediction  [B, L_pred, D]
+            x_context  : encoder input     [B, L_enc,  D]  (optional)
+                         When provided, normalisation statistics and sharpness
+                         are derived from x_context instead of y_hat.
+            return_params: if True, also return an aux dict with internals.
 
         Returns:
-            calibrated: Calibrated prediction, shape [B, L, D].
-            aux: Optional dictionary for analysis/debugging.
+            calibrated [B, L_pred, D]  (+ aux dict if return_params=True)
         """
         if y_hat.dim() != 3:
             raise ValueError("Expected y_hat shape [B, L, D].")
 
-        _, _, channels = y_hat.shape
-        d1, d2 = finite_differences(y_hat)
-        y_sharpness = self._sharpness_score(d1, d2)
-        x_dynamics = self._input_context_dynamics(y_sharpness.size(1), x_context)
-        x_sharpness = x_dynamics["x_sharpness"] if x_dynamics is not None else None
-        sharpness, _ = self._merge_input_context_sharpness(y_sharpness, x_context, x_dynamics=x_dynamics)
+        # ------------------------------------------------------------------
+        # 1. Normalise y_hat using its own statistics → z used for spline
+        # ------------------------------------------------------------------
+        z, means, stdev = self._normalize(y_hat)
 
-        trend = self._temporal_moving_average(y_hat)
-        local_deviation = y_hat - trend
-
-        mlp_residual = None
-        if self.use_mlp_head:
-            mlp_residual = self._predict_residual_with_mlp(
-                y_hat, d1, d2, local_deviation, sharpness, x_dynamics
+        # ------------------------------------------------------------------
+        # 2. Spline correction (operates on z, i.e. normalised y_hat)
+        #    Optional: modulate spline parameters from x_context patterns.
+        # ------------------------------------------------------------------
+        context_spline = None
+        use_context = x_context is not None and x_context.dim() == 3
+        if self.use_context_spline and use_context:
+            context_spline = self._compute_context_spline_modulation(x_context, z)
+            spline_res = self.spline(
+                z,
+                weight_delta=context_spline["weight_delta"],
+                range_delta=context_spline["range_delta"],
+                knot_offset_delta=context_spline["knot_offset_delta"],
+                modulation_scale=self.context_spline_modulation_scale,
             )
+        else:
+            spline_res = self.spline(z)
+        spline_res = spline_res - spline_res.mean(dim=1, keepdim=True)
+        # [개선 3] temporal mixing: [B, L, D] → [B, D, L] → conv → [B, L, D]
+        spline_res = self.temporal_mix(spline_res.permute(0, 2, 1)).permute(0, 2, 1)
 
-        basis, widths = self._knot_basis(sharpness)
-        gamma, beta = self._project_params(basis, channels)
-        correction = gamma * local_deviation + beta * d2
-        if mlp_residual is not None:
-            correction = correction + mlp_residual
+        # ------------------------------------------------------------------
+        # 3. Gate / residual source: x_context if available, else y_hat
+        #    Normalised separately so sharpness is scale-invariant.
+        # ------------------------------------------------------------------
+        gate_source = x_context if use_context else y_hat
+        gate_z, _, _ = self._normalize(gate_source)   # independent normalisation
 
-        dynamics_gate = None
-        if self.use_dynamics_gate:
-            dynamics_gate = self._compute_dynamics_gate(sharpness)
-            correction = correction * dynamics_gate
+        sharpness = None
+        sharpness_gate = None
+        error_gate = None
+        sharp_residual = None
+        x_d1 = None
+        x_d2 = None
 
-        horizon_len = y_hat.size(1)
-        horizon_scale = max(float(horizon_len) / float(self.horizon_decay_ref_len), 1e-6)
-        effective_power = float(self.horizon_decay_power) * (horizon_scale ** float(self.horizon_decay_length_power))
-        horizon_decay = torch.linspace(
-            1.0,
-            float(self.horizon_decay_floor),
-            horizon_len,
-            device=y_hat.device,
-            dtype=y_hat.dtype,
-        ).pow(effective_power).view(1, -1, 1)
-        correction = correction * horizon_decay
+        if self.use_sharpness_gate or self.use_sharp_residual or self.use_error_aware_gate:
+            sharpness, x_d1, x_d2 = self._compute_sharpness(gate_z)
+
+        # ------------------------------------------------------------------
+        # 4. Accumulate delta = spline_res [+ sharp_residual]
+        # ------------------------------------------------------------------
+        delta = spline_res
+
+        if self.use_sharp_residual and sharpness is not None:
+            # Reuse d1/d2 already computed above — no redundant finite_differences call
+            sharp_residual = self._compute_sharp_residual(gate_z, x_d1, x_d2, sharpness)
+            sharp_residual = self._match_seq_len(sharp_residual, delta.size(1))
+            delta = delta + sharp_residual
+
+        if self.use_error_aware_gate and sharpness is not None:
+            error_gate = self._compute_error_aware_gate(gate_z, x_d1, x_d2)
+            error_gate = self._match_seq_len(error_gate, delta.size(1))
+            delta = delta * error_gate
+
+        # ------------------------------------------------------------------
+        # 5. Re-scale correction back to original y_hat scale and add
+        #    [개선 2] tanh으로 delta 크기 제한 + learnable scale
+        # ------------------------------------------------------------------
+        correction = torch.tanh(delta) * F.softplus(self.correction_scale) * stdev
+        if self.use_sharpness_gate and sharpness is not None:
+            sharpness_gate = self._compute_sharpness_gate(sharpness)
+            sharpness_gate = self._match_seq_len(sharpness_gate, correction.size(1))
+            correction = sharpness_gate * correction
         calibrated = y_hat + correction
 
         if not return_params:
             return calibrated
 
         aux = {
-            "gamma": gamma,
-            "beta": beta,
+            "z": z,
+            "gate_z": gate_z,
+            "spline_res": spline_res,
+            "correction": correction,
+            "context_mean": means,
+            "context_std": stdev,
+            "spline_range": F.softplus(self.spline.range_param).detach(),
+            "spline_weight": self.spline.weight,
+            "spline_type": self.spline_type,
+            "correction_scale": F.softplus(self.correction_scale).detach(),
+            "knot_offsets": self.spline.knot_offsets.detach() if getattr(self.spline, "knot_offsets", None) is not None else None,
             "sharpness": sharpness,
-            "y_sharpness": y_sharpness,
-            "x_sharpness": x_sharpness,
-            "x_d1": x_dynamics["x_d1"] if x_dynamics is not None else None,
-            "x_d2": x_dynamics["x_d2"] if x_dynamics is not None else None,
-            "x_local_deviation": x_dynamics["x_local_deviation"] if x_dynamics is not None else None,
-            "d1": d1,
-            "d2": d2,
-            "knot_basis": basis,
-            "adaptive_widths": widths,
-            "mlp_residual": mlp_residual,
-            "dynamics_gate": dynamics_gate,
-            "horizon_decay": horizon_decay,
+            "sharpness_gate": sharpness_gate,
+            "error_gate": error_gate,
+            "sharp_residual": sharp_residual,
+            "x_d1": x_d1,
+            "x_d2": x_d2,
+            "context_spline_weight_delta": None if context_spline is None else context_spline["weight_delta"],
+            "context_spline_range_delta": None if context_spline is None else context_spline["range_delta"],
+            "context_spline_knot_delta": None if context_spline is None else context_spline["knot_offset_delta"],
+            "context_spline_z": None if context_spline is None else context_spline["context_z"],
+            "context_spline_d1": None if context_spline is None else context_spline["context_d1"],
+            "context_spline_d2": None if context_spline is None else context_spline["context_d2"],
+            "context_spline_attention_map": None if context_spline is None else context_spline["attention_map"],
         }
         return calibrated, aux
 
 
+# Backward-compatible alias
+SharpFluctuationCalibrator = ValueSplineCalibrator
+
+
 class PostHocCalibration(nn.Module):
-    """
-    Thin wrapper name for plug-in use after any forecasting backbone.
+    """Plug-in calibration wrapper for the SOM (SCINet) path.
+
+    Typical integration with Model in scinet.py:
+
+        # Inside Model.__init__:
+        self.calibrator = PostHocCalibration(num_channels=configs.enc_in, ...)
+
+        # Inside Model.forecast:
+        raw = self._forecast_raw(x_enc)          # existing SCINet output
+        return self.calibrator(raw, x_context=x_enc)
     """
 
     def __init__(self, **kwargs):
-        super(PostHocCalibration, self).__init__()
-        self.calibrator = SharpFluctuationCalibrator(**kwargs)
+        super().__init__()
+        self.calibrator = ValueSplineCalibrator(**kwargs)
 
     def forward(self, y_hat, x_context=None, return_params=False):
         return self.calibrator(y_hat, x_context=x_context, return_params=return_params)
 
 
 class Model(PostHocCalibration):
-    """Compatibility alias for code paths that expect a Model class."""
-
     pass

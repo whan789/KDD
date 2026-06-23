@@ -47,15 +47,26 @@ def resolve_default_root_path(data):
     return resolve_workspace_path(*dataset_roots.get(data, ('datasets',)))
 
 
+def resolve_dataset_tag(args):
+    if getattr(args, 'data', None) != 'custom':
+        return args.data
+
+    data_path = getattr(args, 'data_path', '') or 'custom'
+    data_name = os.path.splitext(os.path.basename(data_path))[0]
+    sanitized = ''.join(ch if ch.isalnum() or ch in ('_', '-') else '_' for ch in data_name)
+    return f'custom_{sanitized}'
+
+
 def build_setting(args, ii, seed, use_som=None):
     som_flag = int(args.use_som if use_som is None else use_som)
     som_variant = getattr(args, 'som_variant', 'sharp')
     som_suffix = f'_{som_variant}' if som_flag else ''
+    dataset_tag = resolve_dataset_tag(args)
     setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_expand{}_dc{}_fc{}_eb{}_dt{}_{}_{}_seed{}_som{}{}'.format(
         args.task_name,
         args.model_id,
         args.model,
-        args.data,
+        dataset_tag,
         args.features,
         args.seq_len,
         args.label_len,
@@ -77,7 +88,7 @@ def build_setting(args, ii, seed, use_som=None):
         som_suffix)
 
     if args.model == 'MambaSingleLayer' and args.task_name == 'classification':
-        setting = f'{args.task_name}_CLS_{args.model_id}_{args.model}_{args.data}_ft{args.features}'                 + f'_sl{args.seq_len}_ll{args.label_len}_pl{args.pred_len}_dm{args.d_model}_ds{args.d_ff}'                 + f'_expand{args.expand}_dc{args.d_conv}_nk{args.num_kernels}'                 + f'_tvdt{int(args.tv_dt)}_tvB{int(args.tv_B)}_tvC{int(args.tv_C)}_useD{int(args.use_D)}_{args.des}_{ii}_seed{seed}_som{som_flag}{som_suffix}'
+        setting = f'{args.task_name}_CLS_{args.model_id}_{args.model}_{dataset_tag}_ft{args.features}'                 + f'_sl{args.seq_len}_ll{args.label_len}_pl{args.pred_len}_dm{args.d_model}_ds{args.d_ff}'                 + f'_expand{args.expand}_dc{args.d_conv}_nk{args.num_kernels}'                 + f'_tvdt{int(args.tv_dt)}_tvB{int(args.tv_B)}_tvC{int(args.tv_C)}_useD{int(args.use_D)}_{args.des}_{ii}_seed{seed}_som{som_flag}{som_suffix}'
     return setting
 
 def resolve_backbone_checkpoint(args, ii, seed):
@@ -124,9 +135,9 @@ if __name__ == '__main__':
                         help='model name, options: [Autoformer, Transformer, TimesNet]')
 
     # data loader
-    parser.add_argument('--data', type=str, required=False, default='ETTm1', help='dataset type')
+    parser.add_argument('--data', type=str, required=False, default='ETTm2', help='dataset type')
     parser.add_argument('--root_path', type=str, default=None, help='root path of the data file')
-    parser.add_argument('--data_path', type=str, default='ETTm1.csv', help='data file')
+    parser.add_argument('--data_path', type=str, default='ETTm2.csv', help='data file')
     parser.add_argument('--features', type=str, default='M',
                         help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
     parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
@@ -217,11 +228,11 @@ if __name__ == '__main__':
     # SOM sharp fluctuation calibration
     parser.add_argument('--use_som', type=str2bool, nargs='?', const=True, default=False,
                         help='enable SOM calibration module; freezes backbone and trains only SOM')
-    parser.add_argument('--som_variant', type=str, default='sharp', choices=['sharp', 'trend', 'signed_spline', 'derivative', 'prototype_derivative'],
+    parser.add_argument('--som_variant', type=str, default='sharp', choices=['sharp', 'basic_spline', 'kan_lite_spline', 'patch_spline', 'trend', 'signed_spline', 'derivative', 'derivative_sharpening', 'prototype_derivative', 'directional_derivative', 'derivative_gated_spline'],
                         help='select the calibration variant used when --use_som is enabled')
     parser.add_argument('--som_lr', type=float, default=1e-3,
                         help='learning rate used when --use_som is enabled')
-    parser.add_argument('--som_lradj', type=str, default='type3',
+    parser.add_argument('--som_lradj', type=str, default='type1',
                         help='learning rate schedule used when --use_som is enabled')
     parser.add_argument('--som_moving_avg_kernel', type=int, default=3,
                         help='moving average kernel used by SOM/trend calibration; must be a positive odd integer')
@@ -233,6 +244,62 @@ if __name__ == '__main__':
                         help='initial raw value for spline gamma table; defaults to -4.0 for sharp and 0.0 for signed_spline')
     parser.add_argument('--som_beta_init', type=float, default=0.0,
                         help='initial raw value for spline beta table')
+    parser.add_argument('--som_spline_init_range', type=float, default=0.3,
+                        help='initial positive range scale used by the value-only spline SOM')
+    parser.add_argument('--som_spline_max_range', type=float, default=5.0,
+                        help='maximum channel-wise knot range used by the value-only spline SOM')
+    parser.add_argument('--som_mixer_init_scale', type=float, default=0.1,
+                        help='initial residual scaling used by the lightweight channel mixer in som_variant=kan_lite_spline')
+    parser.add_argument('--som_patch_len', type=int, default=5,
+                        help='temporal patch length used by som_variant=patch_spline')
+    parser.add_argument('--som_patch_hidden_dim', type=int, default=64,
+                        help='hidden width of the patch MLP used by som_variant=patch_spline')
+    parser.add_argument('--som_patch_init_scale', type=float, default=0.1,
+                        help='initial residual scaling used by the temporal patch branch in som_variant=patch_spline')
+    parser.add_argument('--som_spline_type', type=str, default='linear', choices=['linear', 'quadratic', 'cubic'],
+                        help='basis type for the sharp SOM spline; quadratic uses relu^2 and cubic uses relu^3 hinge bases')
+    parser.add_argument('--som_learnable_knot_offsets', type=str2bool, nargs='?', const=True, default=False,
+                        help='learn monotonic per-channel knot adjustments on top of the fixed base knot grid')
+    parser.add_argument('--som_knot_offset_scale', type=float, default=1.0,
+                        help='multiplier controlling the magnitude of learnable knot offsets')
+    parser.add_argument('--som_use_sharpness_gate', type=str2bool, nargs='?', const=True, default=False,
+                        help='suppress value-only spline correction in sharp regimes using a derivative-based gate')
+    parser.add_argument('--som_use_error_aware_gate', type=str2bool, nargs='?', const=True, default=False,
+                        help='learn an error-aware amplification gate from observed derivatives and supervise it with target errors')
+    parser.add_argument('--som_error_gate_hidden_dim', type=int, default=16,
+                        help='hidden width of the error-aware gate Conv1d branch in som_variant=sharp')
+    parser.add_argument('--som_error_gate_kernel_size', type=int, default=3,
+                        help='temporal kernel size of the error-aware gate Conv1d branch in som_variant=sharp')
+    parser.add_argument('--som_error_gate_max_boost', type=float, default=1.0,
+                        help='maximum multiplicative boost applied by the learned error-aware gate')
+    parser.add_argument('--som_error_gate_temperature', type=float, default=1.0,
+                        help='temperature used when mapping error-aware gate logits to a boost scale')
+    parser.add_argument('--som_error_gate_loss_weight', type=float, default=0.0,
+                        help='auxiliary loss weight for supervising the error-aware gate against target error patterns')
+    parser.add_argument('--som_sharpness_gate_floor', type=float, default=0.0,
+                        help='minimum spline residual fraction preserved after sharpness suppression in som_variant=sharp')
+    parser.add_argument('--som_sharpness_gate_power', type=float, default=1.0,
+                        help='power applied to the sharpness suppression gate in som_variant=sharp')
+    parser.add_argument('--som_sharpness_d2_weight', type=float, default=1.0,
+                        help='relative second-derivative weight when computing the sharpness gate in som_variant=sharp')
+    parser.add_argument('--som_use_sharp_residual', type=str2bool, nargs='?', const=True, default=False,
+                        help='add a sharp-region residual branch on top of the value-only spline SOM')
+    parser.add_argument('--som_sharp_residual_hidden_dim', type=int, default=16,
+                        help='hidden width of the sharp-region residual Conv1d branch in som_variant=sharp')
+    parser.add_argument('--som_sharp_residual_kernel_size', type=int, default=3,
+                        help='temporal kernel size of the sharp-region residual Conv1d branch in som_variant=sharp')
+    parser.add_argument('--som_sharp_residual_scale', type=float, default=0.25,
+                        help='output scale applied to the sharp-region residual branch in som_variant=sharp')
+    parser.add_argument('--som_use_context_spline', type=str2bool, nargs='?', const=True, default=False,
+                        help='condition sharp SOM spline parameters on x_enc so context patterns can steer correction shape')
+    parser.add_argument('--som_context_spline_attention_dim', type=int, default=32,
+                        help='attention width used by the x_enc-conditioned spline cross-attention encoder')
+    parser.add_argument('--som_context_spline_num_heads', type=int, default=4,
+                        help='number of attention heads used by the x_enc-conditioned spline cross-attention encoder')
+    parser.add_argument('--som_context_spline_ff_hidden_dim', type=int, default=64,
+                        help='feed-forward hidden width used after cross-attention in the x_enc-conditioned spline encoder')
+    parser.add_argument('--som_context_spline_modulation_scale', type=float, default=0.5,
+                        help='maximum tanh-scaled modulation strength applied to spline weights/ranges from x_enc context')
     parser.add_argument('--som_slope_bound', type=float, default=0.5,
                         help='absolute bound for signed_spline d1/slope correction')
     parser.add_argument('--som_bias_bound', type=float, default=0.1,
@@ -243,7 +310,7 @@ if __name__ == '__main__':
                         help='initial raw value for signed_spline d1/slope table')
     parser.add_argument('--som_bias_init', type=float, default=0.0,
                         help='initial raw value for signed_spline level/bias table')
-    parser.add_argument('--seeds', type=int, nargs='+', default=[42, 43, 44], help='random seeds to run and average')
+    parser.add_argument('--seeds', type=int, nargs='+', default=[42,43,44], help='random seeds to run and average')
     parser.add_argument('--backbone_checkpoint', type=str, default=None,
                         help='pretrained backbone checkpoint path for --use_som; defaults to the matching som0 setting')
     parser.add_argument('--som_use_mlp_head', type=str2bool, nargs='?', const=True, default=True,
@@ -270,11 +337,13 @@ if __name__ == '__main__':
                         help='initial sigmoid output of the d1/d2 correction gate at zero sharpness')
     parser.add_argument('--som_dynamics_gate_floor', type=float, default=0.0,
                         help='minimum residual fraction preserved by the d1/d2 correction gate')
+    parser.add_argument('--som_use_input_sharpness_gate', type=str2bool, nargs='?', const=True, default=True,
+                        help='build the derivative suppression gate from input sharpness instead of output sharpness')
     parser.add_argument('--som_recent_len', type=int, default=12,
                         help='sliding-window length for prototype_derivative d1/d2 tokens')
     parser.add_argument('--som_segment_stride', type=int, default=None,
                         help='sliding-window stride for prototype_derivative; defaults to window length')
-    parser.add_argument('--som_correction_scale', type=float, default=1.0,
+    parser.add_argument('--som_correction_scale', type=float, default=0.2,
                         help='scale multiplier for derivative-aware SOM correction')
     parser.add_argument('--som_num_knots', type=int, default=8,
                         help='number of spline knots used by SOM-style modulation')
@@ -282,12 +351,40 @@ if __name__ == '__main__':
                         help='relative weight of second derivative when computing SOM sharpness')
     parser.add_argument('--som_sharpness_temperature', type=float, default=1.0,
                         help='temperature used to squash SOM sharpness scores')
+    parser.add_argument('--som_sharpness_mode', type=str, default='heuristic', choices=['heuristic', 'heatmap_cnn'],
+                        help='sharpness scorer used by derivative SOM modulation')
+    parser.add_argument('--som_sharpness_hidden_dim', type=int, default=16,
+                        help='hidden width of the learned heatmap CNN sharpness scorer')
+    parser.add_argument('--som_sharpness_kernel_size', type=int, default=3,
+                        help='temporal kernel size of the learned heatmap CNN sharpness scorer')
+    parser.add_argument('--som_use_dilate_loss', type=str2bool, nargs='?', const=True, default=False,
+                        help='add a DILATE-style shape/time auxiliary loss when training derivative SOM')
+    parser.add_argument('--som_dilate_loss_weight', type=float, default=0.1,
+                        help='global weight applied to the DILATE-style auxiliary loss')
+    parser.add_argument('--som_dilate_shape_weight', type=float, default=1.0,
+                        help='relative weight of the DILATE-style shape term')
+    parser.add_argument('--som_dilate_time_weight', type=float, default=1.0,
+                        help='relative weight of the DILATE-style time-distortion term')
+    parser.add_argument('--som_dilate_d1_weight', type=float, default=0.5,
+                        help='shape-term weight for first-derivative alignment inside the DILATE-style loss')
+    parser.add_argument('--som_dilate_d2_weight', type=float, default=1.0,
+                        help='shape-term weight for second-derivative alignment inside the DILATE-style loss')
+    parser.add_argument('--som_dilate_time_temperature', type=float, default=0.25,
+                        help='softmax temperature used to estimate event timing in the DILATE-style loss')
     parser.add_argument('--som_use_times2d_modulation', type=str2bool, nargs='?', const=True, default=False,
                         help='modulate Times2D derivative correction with a spline-style SOM map')
     parser.add_argument('--som_times2d_modulation_bound', type=float, default=0.5,
                         help='maximum residual scaling offset applied on top of Times2D correction')
     parser.add_argument('--som_times2d_modulation_init', type=float, default=0.0,
                         help='initial raw value for the Times2D modulation spline table')
+    parser.add_argument('--som_correction_head_type', type=str, default='conv', choices=['conv', 'mlp'],
+                        help='projection head used to map derivative features into prediction-horizon corrections')
+    parser.add_argument('--som_correction_mlp_hidden_dim', type=int, default=128,
+                        help='hidden width used when som_correction_head_type=mlp')
+    parser.add_argument('--som_use_prediction_features', type=str2bool, nargs='?', const=True, default=False,
+                        help='add a small y_hat-shape feature branch on top of the derivative correction head')
+    parser.add_argument('--som_prediction_feature_hidden_dim', type=int, default=64,
+                        help='hidden width used by the y_hat-shape feature branch when enabled')
     parser.add_argument('--som_num_prototypes', type=int, default=8,
                         help='number of local d1/d2 prototypes for prototype_derivative')
     parser.add_argument('--som_prototype_temperature', type=float, default=1.0,
@@ -318,6 +415,54 @@ if __name__ == '__main__':
                         help='number of iterations for prototype_derivative k-means initialization')
     parser.add_argument('--som_gate_init', type=float, default=0.1,
                         help='initial sigmoid gate value for derivative-aware SOM')
+    parser.add_argument('--som_derivative_hidden_dim', type=int, default=16,
+                        help='hidden width per channel for som_variant=derivative_sharpening')
+    parser.add_argument('--som_derivative_kernel_size', type=int, default=3,
+                        help='temporal kernel size for som_variant=derivative_sharpening')
+    parser.add_argument('--som_need_gate_init', type=float, default=0.1,
+                        help='initial sigmoid value for the correction-need gate in derivative_sharpening')
+    parser.add_argument('--som_need_gate_loss_weight', type=float, default=0.5,
+                        help='auxiliary loss weight for matching predicted need gate to target-based correction need')
+    parser.add_argument('--som_derivative_aux_d1_weight', type=float, default=0.1,
+                        help='auxiliary loss weight for matching predicted d1(y_true) in som_variant=derivative_sharpening')
+    parser.add_argument('--som_derivative_aux_d2_weight', type=float, default=0.1,
+                        help='auxiliary loss weight for matching predicted d2(y_true) in som_variant=derivative_sharpening')
+    parser.add_argument('--som_derivative_consistency_weight', type=float, default=0.05,
+                        help='consistency loss weight between corrected output derivatives and derivative predictions')
+    parser.add_argument('--som_output_d1_loss_weight', type=float, default=0.1,
+                        help='sharpness-weighted loss weight for matching d1(corrected output) to d1(y_true)')
+    parser.add_argument('--som_output_d2_loss_weight', type=float, default=0.05,
+                        help='sharpness-weighted loss weight for matching d2(corrected output) to d2(y_true)')
+    parser.add_argument('--som_output_d1_fft_loss_weight', type=float, default=0.05,
+                        help='band-limited FFT magnitude loss weight for matching d1(corrected output) to d1(y_true)')
+    parser.add_argument('--som_output_d1_fft_low_ratio', type=float, default=0.1,
+                        help='lower FFT bin ratio used for band-limited d1 FFT loss in derivative_sharpening')
+    parser.add_argument('--som_output_d1_fft_high_ratio', type=float, default=0.4,
+                        help='upper FFT bin ratio used for band-limited d1 FFT loss in derivative_sharpening')
+    parser.add_argument('--som_need_window', type=int, default=9,
+                        help='odd local window length for target-based correction-need scoring in derivative_sharpening')
+    parser.add_argument('--som_need_excursion_weight', type=float, default=1.0,
+                        help='weight for local target range when computing correction-need score')
+    parser.add_argument('--som_need_derivative_weight', type=float, default=0.5,
+                        help='weight for local d1/d2 target energy when computing correction-need score')
+    parser.add_argument('--som_need_d2_weight', type=float, default=0.5,
+                        help='relative d2 contribution inside local derivative energy for correction-need score')
+    parser.add_argument('--som_need_loss_alpha', type=float, default=0.5,
+                        help='strength of correction-need weighting in derivative_sharpening loss; 0 disables it')
+    parser.add_argument('--som_need_loss_max_weight', type=float, default=5.0,
+                        help='maximum per-step loss weight from correction-need scoring')
+    parser.add_argument('--som_need_output_loss_weight', type=float, default=1.0,
+                        help='base output MSE weight in derivative_sharpening residual-target training')
+    parser.add_argument('--som_residual_target_loss_weight', type=float, default=0.0,
+                        help='weight for directly matching correction to y_true - backbone forecast')
+    parser.add_argument('--som_residual_detail_loss_weight', type=float, default=0.5,
+                        help='weight for matching high-frequency correction detail to high-frequency target residual')
+    parser.add_argument('--som_residual_detail_window', type=int, default=25,
+                        help='odd moving average window used to remove low-frequency residual detail')
+    parser.add_argument('--som_correction_mean_loss_weight', type=float, default=0.1,
+                        help='penalty weight for non-zero mean correction over the prediction horizon')
+    parser.add_argument('--som_flat_correction_loss_weight', type=float, default=0.01,
+                        help='regularization weight that keeps correction small in low-need regions')
 
     # Augmentation
     parser.add_argument('--augmentation_ratio', type=int, default=0, help="How many times to augment")
